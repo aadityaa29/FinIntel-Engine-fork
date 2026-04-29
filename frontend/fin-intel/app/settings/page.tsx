@@ -3,19 +3,21 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTheme } from "next-themes";
 import {
   Settings, Sun, Moon, Globe, DollarSign, Bell, Shield,
-  ChevronLeft, Check, Save, TrendingUp, Zap, Eye,
-  ToggleLeft, ToggleRight, AlertCircle,
+  ChevronLeft, Check, Save, TrendingUp, Eye, AlertCircle
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
+import { db } from "@/lib/firebase"; 
+import { doc, getDoc, setDoc } from "firebase/firestore";
 import toast from "react-hot-toast";
 
 // ─────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────
 interface Prefs {
-  theme: "dark" | "light";
+  theme: "dark" | "light" | "system";
   defaultMarket: "US" | "IN" | "GLOBAL";
   currency: "USD" | "INR" | "EUR" | "GBP";
   defaultSymbol: string;
@@ -38,38 +40,39 @@ const SECTIONS = ["Appearance", "Markets", "Notifications", "Display", "Privacy"
 type Section = typeof SECTIONS[number];
 
 // ─────────────────────────────────────────────
-// TOGGLE
+// COMPONENTS
 // ─────────────────────────────────────────────
 const Toggle = ({ value, onChange, label, desc }: { value: boolean; onChange: (v: boolean) => void; label: string; desc?: string }) => (
-  <div className="flex items-center justify-between py-3.5 border-b border-white/[0.04] last:border-0">
+  <div className="flex items-center justify-between py-3.5 border-b border-gray-200 dark:border-white/[0.04] last:border-0">
     <div className="flex-1 mr-4">
-      <p className="text-sm font-semibold text-gray-200">{label}</p>
+      <p className="text-sm font-semibold text-gray-900 dark:text-gray-200">{label}</p>
       {desc && <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{desc}</p>}
     </div>
-    <button onClick={() => onChange(!value)} className={`relative flex-shrink-0 w-11 h-6 rounded-full transition-all duration-300 focus-visible:ring-2 focus-visible:ring-blue-500 outline-none ${value ? "bg-blue-600" : "bg-white/[0.1]"}`}>
+    <button onClick={() => onChange(!value)} className={`relative flex-shrink-0 w-11 h-6 rounded-full transition-all duration-300 focus-visible:ring-2 focus-visible:ring-blue-500 outline-none ${value ? "bg-blue-600" : "bg-gray-300 dark:bg-white/[0.1]"}`}>
       <motion.div animate={{ x: value ? 22 : 2 }} transition={{ type: "spring", stiffness: 600, damping: 35 }}
         className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-md" />
     </button>
   </div>
 );
 
-// ─────────────────────────────────────────────
-// SELECT
-// ─────────────────────────────────────────────
 const OptionGroup = ({ options, value, onChange }: { options: { value: string; label: string; desc?: string; flag?: string }[]; value: string; onChange: (v: string) => void }) => (
   <div className="grid gap-2">
     {options.map(opt => (
       <button key={opt.value} onClick={() => onChange(opt.value)}
-        className={`flex items-center gap-3 p-3.5 rounded-xl border transition-all text-left ${value === opt.value ? "bg-blue-500/10 border-blue-500/30 text-blue-300" : "bg-white/[0.02] border-white/[0.06] text-gray-400 hover:bg-white/[0.05] hover:border-white/10 hover:text-gray-200"}`}>
+        className={`flex items-center gap-3 p-3.5 rounded-xl border transition-all text-left ${
+          value === opt.value 
+            ? "bg-blue-50 dark:bg-blue-500/10 border-blue-200 dark:border-blue-500/30 text-blue-700 dark:text-blue-300" 
+            : "bg-white dark:bg-white/[0.02] border-gray-200 dark:border-white/[0.06] text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-white/[0.05] hover:border-gray-300 dark:hover:border-white/10 hover:text-gray-900 dark:hover:text-gray-200"
+        }`}>
         {opt.flag && <span className="text-xl">{opt.flag}</span>}
         <div className="flex-1 min-w-0">
           <p className="text-sm font-semibold">{opt.label}</p>
-          {opt.desc && <p className="text-xs opacity-60 mt-0.5">{opt.desc}</p>}
+          {opt.desc && <p className="text-xs opacity-70 mt-0.5">{opt.desc}</p>}
         </div>
         <AnimatePresence>
           {value === opt.value && (
             <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}
-              className="w-5 h-5 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
+              className="w-5 h-5 rounded-full bg-blue-600 dark:bg-blue-500 flex items-center justify-center flex-shrink-0">
               <Check size={11} className="text-white" />
             </motion.div>
           )}
@@ -79,15 +82,12 @@ const OptionGroup = ({ options, value, onChange }: { options: { value: string; l
   </div>
 );
 
-// ─────────────────────────────────────────────
-// SECTION CARD
-// ─────────────────────────────────────────────
 const SectionCard = ({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) => (
   <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
-    className="bg-white/[0.02] border border-white/[0.06] rounded-2xl overflow-hidden">
-    <div className="px-5 py-4 border-b border-white/[0.06] flex items-center gap-2.5">
-      <span className="text-blue-400">{icon}</span>
-      <h3 className="font-bold text-sm">{title}</h3>
+    className="bg-white dark:bg-white/[0.02] border border-gray-200 dark:border-white/[0.06] shadow-sm dark:shadow-none rounded-2xl overflow-hidden">
+    <div className="px-5 py-4 border-b border-gray-200 dark:border-white/[0.06] flex items-center gap-2.5">
+      <span className="text-blue-500 dark:text-blue-400">{icon}</span>
+      <h3 className="font-bold text-sm text-gray-900 dark:text-white">{title}</h3>
     </div>
     <div className="p-5">{children}</div>
   </motion.div>
@@ -98,58 +98,103 @@ const SectionCard = ({ title, icon, children }: { title: string; icon: React.Rea
 // ─────────────────────────────────────────────
 export default function SettingsPage() {
   const router = useRouter();
-  const { user, loading } = useAuth();
+  const { user, loading: authLoading } = useAuth();
+  const { theme, setTheme } = useTheme(); 
+  
   const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
+  const [loadingData, setLoadingData] = useState(true);
   const [saved, setSaved] = useState(false);
   const [activeSection, setActiveSection] = useState<Section>("Appearance");
+  const [mounted, setMounted] = useState(false);
 
-  // Load from localStorage
+  useEffect(() => setMounted(true), []);
+
+  // 1. Load from Main User Document in Firestore
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem("fin_prefs");
-      if (stored) setPrefs({ ...DEFAULT_PREFS, ...JSON.parse(stored) });
-    } catch {}
-  }, []);
+    const fetchSettings = async () => {
+      if (!user) return;
+      try {
+        const docRef = doc(db, "users", user.uid); // Points directly to the user document
+        const docSnap = await getDoc(docRef);
+        
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (data.preferences) {
+            const mergedPrefs = { ...DEFAULT_PREFS, ...data.preferences };
+            setPrefs(mergedPrefs);
+            
+            // Apply theme strictly on load
+            if (mergedPrefs.theme && mergedPrefs.theme !== theme) {
+              setTheme(mergedPrefs.theme);
+            }
+          }
+        }
+      } catch (error: any) {
+        toast.error("Error loading settings: " + error.message);
+      } finally {
+        setLoadingData(false);
+      }
+    };
 
-  if (loading) return (
-    <div className="min-h-screen bg-[#060606] flex items-center justify-center">
+    if (!authLoading) {
+      fetchSettings();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, authLoading]); // Excluded setTheme/theme to prevent infinite loops
+
+  if (authLoading || loadingData) return (
+    <div className="min-h-screen bg-gray-50 dark:bg-[#060606] flex items-center justify-center">
       <div className="w-8 h-8 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
     </div>
   );
+  
   if (!user) { router.push("/login"); return null; }
 
+  // State setters
   const set = <K extends keyof Prefs>(key: K, val: Prefs[K]) => setPrefs(p => ({ ...p, [key]: val }));
   const setNotif = (key: keyof Prefs["notifications"], val: boolean) => setPrefs(p => ({ ...p, notifications: { ...p.notifications, [key]: val } }));
   const setPrivacy = (key: keyof Prefs["privacy"], val: boolean) => setPrefs(p => ({ ...p, privacy: { ...p.privacy, [key]: val } }));
   const setDisplay = (key: keyof Prefs["display"], val: boolean) => setPrefs(p => ({ ...p, display: { ...p.display, [key]: val } }));
 
-  const handleSave = () => {
-    try { localStorage.setItem("fin_prefs", JSON.stringify(prefs)); } catch {}
-    setSaved(true);
-    toast.success("Preferences saved!");
-    setTimeout(() => setSaved(false), 2500);
+  // Handle Theme Change instantly
+  const handleThemeChange = (newTheme: string) => {
+    set("theme", newTheme as Prefs["theme"]);
+    setTheme(newTheme); // Applies globally via next-themes instantly
+  };
+
+  // 2. Save explicitly to the User Document
+  const handleSave = async () => {
+    try {
+      const userRef = doc(db, "users", user.uid);
+      await setDoc(userRef, { preferences: prefs }, { merge: true }); // Merges without deleting your watchlist array
+      setSaved(true);
+      toast.success("Preferences saved to cloud!");
+      setTimeout(() => setSaved(false), 2500);
+    } catch (error: any) {
+      toast.error("Failed to save: " + error.message);
+    }
   };
 
   return (
-    <main className="min-h-screen bg-[#060606] text-white pt-28 pb-16">
+    <main className="min-h-screen bg-gray-50 dark:bg-[#060606] text-gray-900 dark:text-white pt-28 pb-16 transition-colors duration-300">
       <div className="fixed inset-0 -z-10 pointer-events-none">
-        <div className="absolute top-20 right-0 w-80 h-80 bg-blue-900/10 blur-[120px] rounded-full" />
+        <div className="absolute top-20 right-0 w-80 h-80 bg-blue-500/5 dark:bg-blue-900/10 blur-[120px] rounded-full" />
       </div>
 
       <div className="max-w-5xl mx-auto px-4 sm:px-6">
         {/* Header */}
         <div className="flex items-center gap-4 mb-8">
           <button onClick={() => router.back()}
-            className="p-2.5 rounded-xl bg-white/[0.04] border border-white/[0.07] text-gray-400 hover:text-white hover:bg-white/[0.07] transition-all">
+            className="p-2.5 rounded-xl bg-white dark:bg-white/[0.04] border border-gray-200 dark:border-white/[0.07] text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-white/[0.07] transition-all shadow-sm dark:shadow-none">
             <ChevronLeft size={18} />
           </button>
           <div>
-            <h1 className="text-2xl font-black flex items-center gap-2"><Settings size={22} className="text-blue-400" /> Preferences</h1>
+            <h1 className="text-2xl font-black flex items-center gap-2"><Settings size={22} className="text-blue-600 dark:text-blue-400" /> Preferences</h1>
             <p className="text-gray-500 text-sm mt-0.5">Customize your FinIntel experience</p>
           </div>
           <button onClick={handleSave}
-            className={`ml-auto flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-sm transition-all ${saved ? "bg-emerald-600 shadow-[0_0_20px_rgba(16,185,129,0.3)]" : "bg-blue-600 hover:bg-blue-500 shadow-[0_0_14px_rgba(59,130,246,0.3)] hover:shadow-[0_0_24px_rgba(59,130,246,0.5)]"}`}>
-            {saved ? <><Check size={16} /> Saved!</> : <><Save size={16} /> Save Changes</>}
+            className={`ml-auto flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-sm text-white transition-all ${saved ? "bg-emerald-500 dark:bg-emerald-600 shadow-[0_0_20px_rgba(16,185,129,0.3)]" : "bg-blue-600 hover:bg-blue-500 shadow-[0_0_14px_rgba(59,130,246,0.3)] hover:shadow-[0_0_24px_rgba(59,130,246,0.5)]"}`}>
+            {saved ? <><Check size={16} /> Saved!</> : <><Save size={16} /> Save</>}
           </button>
         </div>
 
@@ -159,7 +204,11 @@ export default function SettingsPage() {
             <div className="flex lg:flex-col gap-1 overflow-x-auto scrollbar-hide pb-1 lg:pb-0">
               {SECTIONS.map(section => (
                 <button key={section} onClick={() => setActiveSection(section)}
-                  className={`flex-shrink-0 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all text-left whitespace-nowrap ${activeSection === section ? "bg-blue-500/10 text-blue-400 border border-blue-500/25" : "text-gray-500 hover:text-gray-300 hover:bg-white/[0.04]"}`}>
+                  className={`flex-shrink-0 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all text-left whitespace-nowrap ${
+                    activeSection === section 
+                      ? "bg-blue-100 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 shadow-sm dark:shadow-none" 
+                      : "text-gray-600 dark:text-gray-500 hover:text-gray-900 dark:hover:text-gray-300 hover:bg-gray-200/50 dark:hover:bg-white/[0.04]"
+                  }`}>
                   {section}
                 </button>
               ))}
@@ -175,11 +224,13 @@ export default function SettingsPage() {
                   <>
                     <SectionCard title="Theme" icon={<Sun size={15} />}>
                       <OptionGroup
-                        value={prefs.theme}
-                        onChange={(v) => set("theme", v as Prefs["theme"])}
+                        // Fallback to local state if next-themes isn't mounted yet
+                        value={mounted ? (theme as string) : prefs.theme}
+                        onChange={handleThemeChange}
                         options={[
-                          { value: "dark", label: "Dark Mode", desc: "Easy on the eyes for trading marathons" },
-                          { value: "light", label: "Light Mode", desc: "Bright and clear for daytime use" },
+                          { value: "light", label: "Light Mode", desc: "Bright and clear for daytime use", flag: "☀️" },
+                          { value: "dark", label: "Dark Mode", desc: "Easy on the eyes for trading marathons", flag: "🌙" },
+                          { value: "system", label: "System", desc: "Follows your operating system settings", flag: "💻" },
                         ]}
                       />
                     </SectionCard>
@@ -191,9 +242,9 @@ export default function SettingsPage() {
                           value={prefs.defaultSymbol}
                           onChange={e => set("defaultSymbol", e.target.value.toUpperCase())}
                           placeholder="e.g. AAPL"
-                          className="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition-colors font-mono uppercase text-sm"
+                          className="w-full bg-gray-50 dark:bg-white/[0.04] border border-gray-200 dark:border-white/[0.08] rounded-xl px-4 py-3 text-gray-900 dark:text-white outline-none focus:border-blue-500 dark:focus:border-blue-500 transition-colors font-mono uppercase text-sm"
                         />
-                        <p className="text-xs text-gray-600 mt-2">This symbol will be analyzed first when you open the dashboard.</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-600 mt-2">This symbol will be analyzed first when you open the dashboard.</p>
                       </div>
                     </SectionCard>
                   </>
@@ -252,12 +303,12 @@ export default function SettingsPage() {
                       <Toggle value={prefs.privacy.analyticsOpt} onChange={v => setPrivacy("analyticsOpt", v)} label="Usage Analytics" desc="Help improve FinIntel by sharing anonymous usage data." />
                     </SectionCard>
 
-                    <div className="bg-amber-500/[0.05] border border-amber-500/20 rounded-2xl p-5">
+                    <div className="bg-amber-50 dark:bg-amber-500/[0.05] border border-amber-200 dark:border-amber-500/20 rounded-2xl p-5">
                       <div className="flex items-start gap-3">
-                        <AlertCircle size={16} className="text-amber-400 mt-0.5 flex-shrink-0" />
+                        <AlertCircle size={16} className="text-amber-500 dark:text-amber-400 mt-0.5 flex-shrink-0" />
                         <div>
-                          <p className="text-sm font-bold text-amber-300 mb-1">Data Notice</p>
-                          <p className="text-xs text-amber-400/70 leading-relaxed">FinIntel stores your preferences locally and does not share personal financial data with third parties. Market data is sourced from public APIs.</p>
+                          <p className="text-sm font-bold text-amber-800 dark:text-amber-300 mb-1">Data Notice</p>
+                          <p className="text-xs text-amber-700/80 dark:text-amber-400/70 leading-relaxed">FinIntel stores your preferences securely in the cloud and does not share personal financial data with third parties. Market data is sourced from public APIs.</p>
                         </div>
                       </div>
                     </div>
@@ -267,10 +318,10 @@ export default function SettingsPage() {
               </motion.div>
             </AnimatePresence>
 
-            {/* Save button (bottom) */}
+            {/* Save button (bottom mobile layout) */}
             <div className="flex justify-end pt-2">
               <button onClick={handleSave}
-                className={`flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm transition-all ${saved ? "bg-emerald-600" : "bg-blue-600 hover:bg-blue-500"}`}>
+                className={`flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm text-white transition-all ${saved ? "bg-emerald-500 dark:bg-emerald-600 shadow-md" : "bg-blue-600 hover:bg-blue-500 shadow-md"}`}>
                 {saved ? <><Check size={15} /> Preferences Saved!</> : <><Save size={15} /> Save Changes</>}
               </button>
             </div>

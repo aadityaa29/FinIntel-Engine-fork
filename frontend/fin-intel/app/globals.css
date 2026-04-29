@@ -49,7 +49,8 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
+  /* Default Light Mode */
+  --background: oklch(0.98 0 0); /* Slightly off-white for better contrast */
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.145 0 0);
@@ -84,7 +85,8 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
+  /* Default Dark Mode */
+  --background: oklch(0.13 0 0); /* Represents your #060606 */
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
   --card-foreground: oklch(0.985 0 0);
@@ -122,9 +124,59 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    /* Because you are using variables above, this automatically switches between light/dark! */
+    @apply bg-background text-foreground transition-colors duration-300;
   }
   html {
     @apply font-sans;
+  }
+}
+
+/* =========================================================
+   LIGHT MODE GLOBAL OVERRIDE HACK
+   Forces hardcoded dark classes to invert when in Light Mode
+   ========================================================= */
+
+@layer utilities {
+  /* 1. Catch all your custom dark hex backgrounds (060606, 080808, 0a0c10, 0c0c0c, 0d0d14) */
+  html:not(.dark) [class*="bg-[#0"] {
+    background-color: #ffffff !important;
+    border-color: #e5e7eb !important;
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+  }
+
+  /* 2. Invert the semi-transparent white borders you used for glassmorphism */
+  html:not(.dark) [class*="border-white/"] {
+    border-color: rgba(0, 0, 0, 0.1) !important;
+  }
+  
+  /* 3. Invert the semi-transparent white backgrounds */
+  html:not(.dark) [class*="bg-white/"] {
+    background-color: rgba(0, 0, 0, 0.03) !important;
+  }
+
+  /* 4. Invert text colors */
+  /* We exclude <button> tags here so your blue primary buttons keep their white text! */
+  html:not(.dark) div:not(button)[class*="text-white"],
+  html:not(.dark) main[class*="text-white"],
+  html:not(.dark) p[class*="text-white"],
+  html:not(.dark) h1[class*="text-white"],
+  html:not(.dark) h2[class*="text-white"],
+  html:not(.dark) h3[class*="text-white"],
+  html:not(.dark) span:not(button)[class*="text-white"] {
+    color: #111827 !important; /* Dark Gray/Black */
+  }
+
+  /* Make your light gray text darker so it's readable on white backgrounds */
+  html:not(.dark) [class*="text-gray-200"],
+  html:not(.dark) [class*="text-gray-300"],
+  html:not(.dark) [class*="text-gray-400"],
+  html:not(.dark) [class*="text-gray-500"] {
+    color: #4b5563 !important; 
+  }
+  
+  /* Fix the main wrapper background if it has bg-[#060606] */
+  html:not(.dark) main {
+    background-color: #f9fafb !important; /* bg-gray-50 */
   }
 }

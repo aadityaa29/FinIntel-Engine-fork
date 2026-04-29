@@ -1,17 +1,18 @@
 "use client";
 
 import { useRouter, usePathname } from "next/navigation";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity, Menu, X, User, Settings, LogOut,
   Search, Bell, Bookmark, ChevronRight, TrendingUp,
-  TrendingDown, BarChart2, Briefcase, Command,
+  TrendingDown, BarChart2, Briefcase, Command, Plus, BellOff, CheckCircle2, Trash2
 } from "lucide-react";
 
 import { useAuth } from "@/hooks/useAuth";
 import { signOut } from "firebase/auth";
-import { auth } from "@/lib/firebase";
+import { auth, db } from "@/lib/firebase"; 
+import { collection, onSnapshot, doc, addDoc, deleteDoc, query } from "firebase/firestore";
 import toast from "react-hot-toast";
 
 // ─────────────────────────────────────────────
@@ -24,19 +25,37 @@ const NAV_LINKS = [
   { name: "Portfolio", path: "/portfolio" },
 ];
 
-const MOCK_NOTIFICATIONS = [
-  { id: 1, title: "Price Alert: NVDA", desc: "NVIDIA crossed $900.00", time: "2m ago", unread: true, type: "alert" },
-  { id: 2, title: "Market Update", desc: "Federal Reserve maintains interest rates.", time: "1h ago", unread: true, type: "market" },
-  { id: 3, title: "Portfolio Update", desc: "Your weekly summary is ready to view.", time: "1d ago", unread: false, type: "portfolio" },
-  { id: 4, title: "Price Alert: TSLA", desc: "Tesla dropped below $170.00", time: "2d ago", unread: false, type: "alert" },
+// ─────────────────────────────────────────────
+// MOCK DATA FALLBACKS
+// ─────────────────────────────────────────────
+const MOCK_WATCHLIST: FirestoreWatchlist[] = [
+  { id: "mock1", symbol: "AAPL", name: "Apple Inc." },
+  { id: "mock2", symbol: "RELIANCE.NS", name: "Reliance Ind." },
+  { id: "mock3", symbol: "BTC", name: "Bitcoin" },
+  { id: "mock4", symbol: "TSLA", name: "Tesla Inc." },
 ];
 
-const MOCK_WATCHLIST = [
-  { symbol: "AAPL", name: "Apple Inc.", price: "$173.50", change: "+0.8%", isUp: true },
-  { symbol: "RELIANCE.NS", name: "Reliance Ind.", price: "₹2,950", change: "+1.5%", isUp: true },
-  { symbol: "BTC", name: "Bitcoin", price: "$64,210", change: "+5.4%", isUp: true },
-  { symbol: "TSLA", name: "Tesla Inc.", price: "$175.22", change: "-2.1%", isUp: false },
-];
+interface FirestoreWatchlist {
+  id: string;
+  symbol: string;
+  name: string;
+}
+
+interface FirestoreHolding {
+  id: string;
+  symbol: string;
+  quantity: number;
+  price: number; 
+}
+
+// ─── CURRENCY LOGIC ──────────────────────────────────────────
+const isIndianStock = (symbol: string) => symbol.endsWith(".NS") || symbol.endsWith(".BO");
+const getNativeCurrency = (symbol: string) => isIndianStock(symbol) ? "INR" : "USD";
+
+const fmtCurrency = (v: number, curr: "INR" | "USD") =>
+  new Intl.NumberFormat(curr === "INR" ? "en-IN" : "en-US", { 
+    style: "currency", currency: curr, maximumFractionDigits: 2 
+  }).format(v);
 
 function checkIsIndianMarketOpen(): boolean {
   const now = new Date();
@@ -45,6 +64,58 @@ function checkIsIndianMarketOpen(): boolean {
   if (day === 0 || day === 6) return false;
   const t = ist.getHours() * 60 + ist.getMinutes();
   return t >= 555 && t <= 930;
+}
+
+// ─────────────────────────────────────────────
+// CUSTOM HOOK: ALERTS
+// ─────────────────────────────────────────────
+export interface AlertItem {
+  id?: string;
+  symbol: string;
+  target_price: number;
+  condition: "above" | "below";
+  note?: string;
+  triggered: boolean;
+  created_at: number;
+}
+
+function useFirestoreAlerts(uid?: string) {
+  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!uid) { setAlerts([]); return; }
+    setLoading(true);
+    const q = query(collection(db, "users", uid, "alerts"));
+    return onSnapshot(q, (s) => {
+      setAlerts(s.docs.map((d) => ({ id: d.id, ...d.data() }) as AlertItem));
+      setLoading(false);
+    });
+  }, [uid]);
+
+  const add = useCallback(
+    async (a: Omit<AlertItem, "id" | "triggered" | "created_at">) => {
+      if (!uid) { toast.error("Sign in first"); return; }
+      await addDoc(collection(db, "users", uid, "alerts"), {
+        ...a,
+        triggered: false,
+        created_at: Date.now(),
+      });
+      toast.success(`Alert set for ${a.symbol}`);
+    },
+    [uid],
+  );
+
+  const remove = useCallback(
+    async (id: string) => {
+      if (!uid) return;
+      await deleteDoc(doc(db, "users", uid, "alerts", id));
+      toast.success("Alert removed");
+    },
+    [uid],
+  );
+
+  return { alerts, loading, add, remove };
 }
 
 // ─────────────────────────────────────────────
@@ -85,6 +156,7 @@ const Avatar = ({ user, size = 32 }: { user: { displayName?: string | null; emai
 const CommandPalette = ({ open, onClose, onNavigate }: { open: boolean; onClose: () => void; onNavigate: (sym: string) => void }) => {
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const router = useRouter();
 
   useEffect(() => {
     if (open) { setQuery(""); setTimeout(() => inputRef.current?.focus(), 50); }
@@ -96,8 +168,6 @@ const CommandPalette = ({ open, onClose, onNavigate }: { open: boolean; onClose:
     { label: "Compare Stocks", path: "/compare", icon: <TrendingUp size={16} /> },
     { label: "Profile & Settings", path: "/profile", icon: <User size={16} /> },
   ];
-
-  const router = useRouter();
 
   return (
     <AnimatePresence>
@@ -168,8 +238,12 @@ const CommandPalette = ({ open, onClose, onNavigate }: { open: boolean; onClose:
 // ─────────────────────────────────────────────
 // WATCHLIST PANEL
 // ─────────────────────────────────────────────
-const WatchlistPanel = ({ open }: { open: boolean }) => {
+const WatchlistPanel = ({ open, watchlist, livePrices }: { open: boolean, watchlist: FirestoreWatchlist[], livePrices: Record<string, any> }) => {
   const router = useRouter();
+  
+  // Fallback to mock data if Firestore is empty for testing UI
+  const displayList = watchlist.length > 0 ? watchlist : MOCK_WATCHLIST;
+
   return (
     <AnimatePresence>
       {open && (
@@ -183,26 +257,33 @@ const WatchlistPanel = ({ open }: { open: boolean }) => {
             </button>
           </div>
           <div className="py-1 max-h-72 overflow-y-auto">
-            {MOCK_WATCHLIST.map(item => (
-              <button key={item.symbol} onClick={() => router.push(`/dashboard?symbol=${item.symbol}`)}
-                className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.04] transition-colors group">
-                <div className="flex items-center gap-3 text-left">
-                  <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-white/[0.07] to-white/[0.02] border border-white/[0.07] flex items-center justify-center text-[9px] font-bold text-blue-400">
-                    {item.symbol.slice(0, 2)}
+            {displayList.map((item, index) => {
+              // Provide an immediate visual fallback for mock data before live polling catches up
+              const fallbackPrice = 150 + (index * 45);
+              const liveData = livePrices[item.symbol] || { price: fallbackPrice, changeStr: "+1.24%", isUp: true };
+              const curr = getNativeCurrency(item.symbol);
+              
+              return (
+                <button key={item.symbol} onClick={() => router.push(`/dashboard?symbol=${item.symbol}`)}
+                  className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.04] transition-colors group">
+                  <div className="flex items-center gap-3 text-left">
+                    <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-white/[0.07] to-white/[0.02] border border-white/[0.07] flex items-center justify-center text-[9px] font-bold text-blue-400">
+                      {item.symbol.slice(0, 2)}
+                    </div>
+                    <div>
+                      <p className="text-xs font-bold text-white">{item.symbol}</p>
+                      <p className="text-[10px] text-gray-500 truncate max-w-[90px]">{item.name}</p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs font-bold text-white">{item.symbol}</p>
-                    <p className="text-[10px] text-gray-500 truncate max-w-[90px]">{item.name}</p>
+                  <div className="text-right">
+                    <p className="text-xs font-semibold text-white">{fmtCurrency(liveData.price, curr)}</p>
+                    <p className={`text-[10px] font-medium flex items-center justify-end gap-0.5 ${liveData.isUp ? "text-emerald-400" : "text-rose-400"}`}>
+                      {liveData.isUp ? <TrendingUp size={9} /> : <TrendingDown size={9} />} {liveData.changeStr}
+                    </p>
                   </div>
-                </div>
-                <div className="text-right">
-                  <p className="text-xs font-semibold text-white">{item.price}</p>
-                  <p className={`text-[10px] font-medium flex items-center justify-end gap-0.5 ${item.isUp ? "text-emerald-400" : "text-rose-400"}`}>
-                    {item.isUp ? <TrendingUp size={9} /> : <TrendingDown size={9} />} {item.change}
-                  </p>
-                </div>
-              </button>
-            ))}
+                </button>
+              )
+            })}
           </div>
           <div className="px-4 py-3 border-t border-white/[0.06]">
             <button onClick={() => router.push("/dashboard")} className="w-full py-2 rounded-xl text-xs font-semibold bg-blue-500/10 text-blue-400 hover:bg-blue-500/15 border border-blue-500/20 transition-colors">
@@ -216,59 +297,136 @@ const WatchlistPanel = ({ open }: { open: boolean }) => {
 };
 
 // ─────────────────────────────────────────────
-// NOTIFICATIONS PANEL
+// ALERTS PANEL (Replaces NotificationsPanel)
 // ─────────────────────────────────────────────
-const NotificationsPanel = ({ open }: { open: boolean }) => {
-  const [notifications, setNotifications] = useState(MOCK_NOTIFICATIONS);
-  const unreadCount = notifications.filter(n => n.unread).length;
+const AlertsPanel = ({ 
+  open, 
+  alertsStore, 
+  onSelectSymbol 
+}: { 
+  open: boolean; 
+  alertsStore: ReturnType<typeof useFirestoreAlerts>; 
+  onSelectSymbol: (sym: string) => void; 
+}) => {
+  const { alerts, loading, add, remove } = alertsStore;
+  const [showAdd, setShowAdd] = useState(false);
+  const [sym, setSym] = useState("");
+  const [price, setPrice] = useState("");
+  const [cond, setCond] = useState<"above" | "below">("above");
+  const [adding, setAdding] = useState(false);
+  const [filter, setFilter] = useState<"all" | "active" | "triggered">("all");
 
-  const markAllRead = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setNotifications(prev => prev.map(n => ({ ...n, unread: false })));
+  const handleAdd = async () => {
+    if (!sym.trim() || !price || isNaN(+price) || +price <= 0) {
+      toast.error("Enter a valid symbol and price");
+      return;
+    }
+    setAdding(true);
+    try {
+      await add({ symbol: sym.trim().toUpperCase(), target_price: +price, condition: cond });
+      setShowAdd(false);
+      setSym(""); setPrice("");
+    } catch (e: any) {
+      toast.error(e.message || "Failed to set alert");
+    }
+    setAdding(false);
   };
 
-  const typeColor = (type: string) => ({ alert: "text-amber-400", market: "text-blue-400", portfolio: "text-emerald-400" }[type] || "text-gray-400");
-  const typeIcon = (type: string) => ({ alert: "⚡", market: "📈", portfolio: "💼" }[type] || "🔔");
+  const shown = filter === "active" ? alerts.filter((a) => !a.triggered) 
+              : filter === "triggered" ? alerts.filter((a) => a.triggered) 
+              : alerts;
 
   return (
     <AnimatePresence>
       {open && (
         <motion.div initial={{ opacity: 0, y: 8, scale: 0.96 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.96 }}
           transition={{ type: "spring", stiffness: 400, damping: 35 }}
-          className="absolute right-0 mt-3 w-80 bg-[#0c0c0c] border border-white/10 rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.6)] overflow-hidden z-[900]">
-          <div className="px-4 py-3 border-b border-white/[0.06] flex items-center justify-between">
+          className="absolute right-0 mt-3 w-96 bg-[#0c0c0c] border border-white/10 rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.6)] overflow-hidden z-[900]">
+          
+          {/* Header */}
+          <div className="px-4 py-3 border-b border-white/[0.06] flex items-center justify-between bg-white/[0.02]">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-bold">Notifications</span>
-              {unreadCount > 0 && (
-                <span className="text-[10px] font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30 px-1.5 py-0.5 rounded-full">{unreadCount}</span>
-              )}
+              <span className="text-sm font-bold text-white">Price Alerts</span>
+              <span className="text-[10px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30 px-1.5 py-0.5 rounded-full">
+                {alerts.length}
+              </span>
             </div>
-            {unreadCount > 0 && (
-              <button onClick={markAllRead} className="text-[11px] text-gray-500 hover:text-white transition-colors">Mark all read</button>
-            )}
+            <button onClick={() => setShowAdd(!showAdd)} className="flex items-center gap-1 text-[11px] font-bold text-amber-400 hover:text-amber-300 transition-colors">
+              <Plus size={12} /> New
+            </button>
           </div>
-          <div className="max-h-80 overflow-y-auto">
-            {notifications.map(n => (
-              <div key={n.id} onClick={() => setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, unread: false } : x))}
-                className={`px-4 py-3.5 border-b border-white/[0.04] cursor-pointer hover:bg-white/[0.03] transition-colors ${n.unread ? "bg-blue-500/[0.03]" : ""}`}>
-                <div className="flex items-start gap-3">
-                  <span className="text-base mt-0.5">{typeIcon(n.type)}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-2 mb-0.5">
-                      <span className={`text-xs font-bold ${n.unread ? typeColor(n.type) : "text-gray-300"}`}>{n.title}</span>
-                      <span className="text-[10px] text-gray-600 flex-shrink-0">{n.time}</span>
+
+          {/* Add Alert Form Dropdown */}
+          <AnimatePresence>
+            {showAdd && (
+              <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+                <div className="p-4 bg-black/40 border-b border-white/[0.06] space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-[9px] text-gray-500 font-bold uppercase tracking-wider block mb-1">Symbol</label>
+                      <input value={sym} onChange={(e) => setSym(e.target.value.toUpperCase())} placeholder="AAPL" className="w-full bg-white/[0.04] border border-white/[0.07] rounded-lg px-3 py-2 text-white text-xs outline-none focus:border-amber-500/40" />
                     </div>
-                    <p className="text-[11px] text-gray-500 leading-relaxed">{n.desc}</p>
+                    <div>
+                      <label className="text-[9px] text-gray-500 font-bold uppercase tracking-wider block mb-1">Target Price</label>
+                      <input type="number" value={price} onChange={(e) => setPrice(e.target.value)} placeholder="150.00" className="w-full bg-white/[0.04] border border-white/[0.07] rounded-lg px-3 py-2 text-white text-xs outline-none focus:border-amber-500/40" />
+                    </div>
                   </div>
-                  {n.unread && <div className="w-1.5 h-1.5 rounded-full bg-blue-400 mt-1.5 flex-shrink-0" />}
+                  <div className="grid grid-cols-2 gap-2">
+                    {(["above", "below"] as const).map((c) => (
+                      <button key={c} onClick={() => setCond(c)} className={`py-1.5 rounded-lg text-[10px] font-bold transition-all ${cond === c ? (c === "above" ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/25" : "bg-rose-500/15 text-rose-400 border-rose-500/25") : "bg-white/[0.03] text-gray-500 border border-white/[0.06]"}`}>
+                        {c === "above" ? "↑ Above" : "↓ Below"}
+                      </button>
+                    ))}
+                  </div>
+                  <button onClick={handleAdd} disabled={adding} className="w-full py-2 rounded-lg bg-amber-500/80 hover:bg-amber-500 text-black disabled:opacity-50 font-bold text-xs mt-1 transition-colors">
+                    {adding ? "Creating…" : "Save Alert"}
+                  </button>
                 </div>
-              </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Filters */}
+          <div className="px-3 py-2 border-b border-white/[0.04] flex gap-1 bg-[#0a0c10]">
+            {(["all", "active", "triggered"] as const).map((f) => (
+              <button key={f} onClick={() => setFilter(f)} className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${filter === f ? "bg-amber-500/10 text-amber-400" : "text-gray-500 hover:text-gray-300"}`}>
+                {f}
+              </button>
             ))}
           </div>
-          <div className="px-4 py-3 border-t border-white/[0.06]">
-            <button className="w-full py-2 rounded-xl text-xs font-semibold text-gray-500 hover:text-white hover:bg-white/[0.04] transition-colors">
-              View all notifications
-            </button>
+
+          {/* Alert List */}
+          <div className="max-h-72 overflow-y-auto">
+            {loading ? (
+              <div className="px-4 py-6 text-center text-xs text-gray-500 animate-pulse">Loading alerts...</div>
+            ) : shown.length === 0 ? (
+              <div className="px-4 py-8 flex flex-col items-center text-center">
+                <BellOff size={24} className="text-gray-700 mb-2" />
+                <p className="text-xs text-gray-500">No alerts found</p>
+              </div>
+            ) : (
+              shown.map((alert) => (
+                <div key={alert.id} className={`group flex items-center justify-between px-4 py-3 border-b border-white/[0.04] transition-colors ${alert.triggered ? "bg-emerald-500/[0.03]" : "hover:bg-white/[0.02]"}`}>
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${alert.triggered ? "bg-emerald-500/15" : alert.condition === "above" ? "bg-emerald-500/10" : "bg-rose-500/10"}`}>
+                      {alert.triggered ? <CheckCircle2 size={14} className="text-emerald-400" /> : alert.condition === "above" ? <TrendingUp size={14} className="text-emerald-400" /> : <TrendingDown size={14} className="text-rose-400" />}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => onSelectSymbol(alert.symbol)} className="text-sm font-bold text-white hover:text-blue-400 transition-colors">{alert.symbol}</button>
+                        {alert.triggered && <span className="text-[9px] font-bold bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded-full">Triggered</span>}
+                      </div>
+                      <p className={`text-[10px] font-semibold mt-0.5 ${alert.condition === "above" ? "text-emerald-400" : "text-rose-400"}`}>
+                        {alert.condition} {alert.target_price.toFixed(2)}
+                      </p>
+                    </div>
+                  </div>
+                  <button onClick={() => alert.id && remove(alert.id)} className="opacity-0 group-hover:opacity-100 p-1.5 rounded-md text-gray-600 hover:text-rose-400 hover:bg-rose-500/10 transition-all">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))
+            )}
           </div>
         </motion.div>
       )}
@@ -279,9 +437,10 @@ const NotificationsPanel = ({ open }: { open: boolean }) => {
 // ─────────────────────────────────────────────
 // PROFILE DROPDOWN
 // ─────────────────────────────────────────────
-const ProfileDropdown = ({ open, user, onClose }: {
+const ProfileDropdown = ({ open, user, stats, onClose }: {
   open: boolean;
   user: { displayName?: string | null; email?: string | null; photoURL?: string | null };
+  stats: { totalValue: number; totalPnlPct: number; alerts: number };
   onClose: () => void;
 }) => {
   const router = useRouter();
@@ -316,9 +475,13 @@ const ProfileDropdown = ({ open, user, onClose }: {
               </div>
             </div>
             <div className="grid grid-cols-3 gap-2">
-              {[{ label: "Saved", value: "12", color: "text-blue-400" }, { label: "Alerts", value: "3", color: "text-amber-400" }, { label: "Gains", value: "+8%", color: "text-emerald-400" }].map(stat => (
+              {[
+                { label: "Value", value: fmtCurrency(stats.totalValue, "USD"), color: "text-blue-400" }, 
+                { label: "Alerts", value: stats.alerts.toString(), color: "text-amber-400" }, 
+                { label: "Return", value: `${stats.totalPnlPct > 0 ? "+" : ""}${stats.totalPnlPct.toFixed(1)}%`, color: stats.totalPnlPct >= 0 ? "text-emerald-400" : "text-rose-400" }
+              ].map(stat => (
                 <div key={stat.label} className="bg-black/40 rounded-xl p-2 text-center border border-white/[0.04]">
-                  <p className={`text-sm font-bold ${stat.color}`}>{stat.value}</p>
+                  <p className={`text-xs font-bold truncate ${stat.color}`}>{stat.value}</p>
                   <p className="text-[9px] text-gray-600 uppercase tracking-wider mt-0.5">{stat.label}</p>
                 </div>
               ))}
@@ -359,10 +522,12 @@ const ProfileDropdown = ({ open, user, onClose }: {
 // ─────────────────────────────────────────────
 // MOBILE MENU
 // ─────────────────────────────────────────────
-const MobileMenu = ({ open, onClose, user, pathname }: {
+const MobileMenu = ({ open, onClose, user, pathname, watchlist, livePrices }: {
   open: boolean; onClose: () => void;
   user: { displayName?: string | null; email?: string | null; photoURL?: string | null } | null;
   pathname: string;
+  watchlist: FirestoreWatchlist[];
+  livePrices: Record<string, any>;
 }) => {
   const router = useRouter();
 
@@ -384,7 +549,6 @@ const MobileMenu = ({ open, onClose, user, pathname }: {
             transition={{ type: "spring", stiffness: 300, damping: 32 }}
             className="fixed top-0 right-0 bottom-0 w-[88vw] max-w-sm bg-[#080808] border-l border-white/[0.07] z-[900] flex flex-col overflow-hidden"
           >
-            {/* Header */}
             <div className="px-6 pt-8 pb-5 border-b border-white/[0.06]">
               <div className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-2">
@@ -398,7 +562,6 @@ const MobileMenu = ({ open, onClose, user, pathname }: {
                 </button>
               </div>
 
-              {/* User card */}
               {user ? (
                 <div className="flex items-center gap-4 bg-gradient-to-r from-white/[0.05] to-transparent p-4 rounded-2xl border border-white/[0.07]">
                   <Avatar user={user} size={48} />
@@ -418,7 +581,6 @@ const MobileMenu = ({ open, onClose, user, pathname }: {
             </div>
 
             <div className="flex-1 overflow-y-auto px-4 py-5 space-y-6">
-              {/* Nav links */}
               <div>
                 <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest px-2 mb-2">Navigate</p>
                 <div className="space-y-1">
@@ -431,7 +593,6 @@ const MobileMenu = ({ open, onClose, user, pathname }: {
                 </div>
               </div>
 
-              {/* Account */}
               {user && (
                 <div>
                   <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest px-2 mb-2">Account</p>
@@ -455,13 +616,17 @@ const MobileMenu = ({ open, onClose, user, pathname }: {
                 <div>
                   <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest px-2 mb-2">Quick Watchlist</p>
                   <div className="space-y-1">
-                    {MOCK_WATCHLIST.slice(0, 3).map(item => (
-                      <button key={item.symbol} onClick={() => navigate(`/dashboard?symbol=${item.symbol}`)}
-                        className="w-full flex items-center justify-between px-4 py-2.5 rounded-xl hover:bg-white/[0.04] transition-colors">
-                        <span className="text-sm font-bold text-white">{item.symbol}</span>
-                        <span className={`text-xs font-semibold ${item.isUp ? "text-emerald-400" : "text-rose-400"}`}>{item.change}</span>
-                      </button>
-                    ))}
+                    {(watchlist.length > 0 ? watchlist : MOCK_WATCHLIST).slice(0, 3).map((item, index) => {
+                      const fallbackPrice = 150 + (index * 45);
+                      const liveData = livePrices[item.symbol] || { price: fallbackPrice, changeStr: "+1.24%", isUp: true };
+                      return (
+                        <button key={item.symbol} onClick={() => navigate(`/dashboard?symbol=${item.symbol}`)}
+                          className="w-full flex items-center justify-between px-4 py-2.5 rounded-xl hover:bg-white/[0.04] transition-colors">
+                          <span className="text-sm font-bold text-white">{item.symbol}</span>
+                          <span className={`text-xs font-semibold ${liveData.isUp ? "text-emerald-400" : "text-rose-400"}`}>{liveData.changeStr}</span>
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
               )}
@@ -490,20 +655,95 @@ export default function Navbar() {
   const pathname = usePathname();
   const { user, loading } = useAuth();
 
+  // UI State
   const [isScrolled, setIsScrolled] = useState(false);
   const [marketOpen, setMarketOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [notifOpen, setNotifOpen] = useState(false);
+  const [alertsOpen, setAlertsOpen] = useState(false);
   const [watchlistOpen, setWatchlistOpen] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
 
+  // Dynamic Data State
+  const [watchlist, setWatchlist] = useState<FirestoreWatchlist[]>([]);
+  const [holdings, setHoldings] = useState<FirestoreHolding[]>([]);
+  const [livePrices, setLivePrices] = useState<Record<string, any>>({});
+  
+  // Custom Hook specifically for Alerts
+  const alertsStore = useFirestoreAlerts(user?.uid);
+
   const profileRef = useRef<HTMLDivElement>(null);
-  const notifRef = useRef<HTMLDivElement>(null);
+  const alertsRef = useRef<HTMLDivElement>(null);
   const watchlistRef = useRef<HTMLDivElement>(null);
 
-  const unreadCount = MOCK_NOTIFICATIONS.filter(n => n.unread).length;
+  // ─── FIRESTORE LISTENERS (Portfolio & Watchlist) ───
+  useEffect(() => {
+    if (!user) return;
 
+    const unsubWatchlist = onSnapshot(collection(db, "users", user.uid, "watchlist"), (snap) => {
+      const data: FirestoreWatchlist[] = [];
+      snap.forEach(doc => data.push({ id: doc.id, ...doc.data() } as FirestoreWatchlist));
+      setWatchlist(data);
+    });
+
+    const unsubPortfolio = onSnapshot(collection(db, "users", user.uid, "portfolio"), (snap) => {
+      const data: FirestoreHolding[] = [];
+      snap.forEach(doc => data.push({ id: doc.id, ...doc.data() } as FirestoreHolding));
+      setHoldings(data);
+    });
+
+    return () => { unsubWatchlist(); unsubPortfolio(); };
+  }, [user]);
+
+  // ─── LIVE PRICE POLLING ───
+  useEffect(() => {
+    if (!user) return;
+    const allSymbols = Array.from(new Set([...watchlist.map(w => w.symbol), ...holdings.map(h => h.symbol)]));
+    if (allSymbols.length === 0) return;
+
+    const fetchPrices = async () => {
+      // TODO: Replace with your actual backend Scraper/API logic
+      const mockPrices: Record<string, any> = {};
+      allSymbols.forEach(sym => {
+        const currentPrice = Math.random() * 5000 + 100;
+        const isUp = Math.random() > 0.5;
+        mockPrices[sym] = {
+          price: currentPrice,
+          changeStr: `${isUp ? "+" : "-"}${(Math.random() * 5).toFixed(2)}%`,
+          isUp
+        };
+      });
+      setLivePrices(prev => ({ ...prev, ...mockPrices }));
+    };
+
+    fetchPrices();
+    const interval = setInterval(fetchPrices, 15000);
+    return () => clearInterval(interval);
+  }, [watchlist, holdings, user]);
+
+  // ─── DERIVED STATS ───
+  // Calculate Triggered alerts for the Red Notification Badge
+  const triggeredAlertCount = alertsStore.alerts.filter(a => a.triggered).length;
+  
+  const profileStats = useMemo(() => {
+    let invested = 0, current = 0;
+    holdings.forEach(h => {
+      const liveData = livePrices[h.symbol];
+      const livePrice = liveData ? liveData.price : h.price;
+      invested += h.price * h.quantity;
+      current += livePrice * h.quantity;
+    });
+    const pnl = current - invested;
+    const totalPnlPct = invested > 0 ? (pnl / invested) * 100 : 0;
+    
+    return {
+      totalValue: current,
+      totalPnlPct,
+      alerts: alertsStore.alerts.length // Total Alerts count for dropdown stats
+    };
+  }, [holdings, livePrices, alertsStore.alerts]);
+
+  // ─── UI EFFECTS ───
   useEffect(() => {
     const onScroll = () => setIsScrolled(window.scrollY > 20);
     window.addEventListener("scroll", onScroll, { passive: true });
@@ -516,49 +756,39 @@ export default function Navbar() {
     return () => clearInterval(id);
   }, []);
 
-  // Close dropdowns on route change
   useEffect(() => {
-    setProfileOpen(false);
-    setNotifOpen(false);
-    setWatchlistOpen(false);
-    setMobileMenuOpen(false);
+    setProfileOpen(false); setAlertsOpen(false); setWatchlistOpen(false); setMobileMenuOpen(false);
   }, [pathname]);
 
-  // Global keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (e.key === "/" && !["INPUT", "TEXTAREA"].includes(tag)) { e.preventDefault(); setCommandOpen(true); }
-      if (e.key === "Escape") { setCommandOpen(false); setProfileOpen(false); setNotifOpen(false); setWatchlistOpen(false); }
+      if (e.key === "Escape") { setCommandOpen(false); setProfileOpen(false); setAlertsOpen(false); setWatchlistOpen(false); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Outside click
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
       if (profileRef.current && !profileRef.current.contains(e.target as Node)) setProfileOpen(false);
-      if (notifRef.current && !notifRef.current.contains(e.target as Node)) setNotifOpen(false);
+      if (alertsRef.current && !alertsRef.current.contains(e.target as Node)) setAlertsOpen(false);
       if (watchlistRef.current && !watchlistRef.current.contains(e.target as Node)) setWatchlistOpen(false);
     };
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
   }, []);
 
-  const closeAll = useCallback(() => { setProfileOpen(false); setNotifOpen(false); setWatchlistOpen(false); }, []);
-
-  const handleNavigate = useCallback((sym: string) => {
-    router.push(`/dashboard?symbol=${sym}`);
-  }, [router]);
-
+  const closeAll = useCallback(() => { setProfileOpen(false); setAlertsOpen(false); setWatchlistOpen(false); }, []);
+  const handleNavigate = useCallback((sym: string) => { router.push(`/dashboard?symbol=${sym}`); }, [router]);
   const isHome = pathname === "/";
 
   return (
     <>
       <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} onNavigate={handleNavigate} />
 
-      <header className={`fixed inset-x-0 z-900 flex justify-center px-4 md:px-6 transition-all duration-500 ${isHome && !isScrolled ? "top-10" : "top-3"}`}>
+      <header className={`fixed inset-x-0 z-[900] flex justify-center px-4 md:px-6 transition-all duration-500 ${isHome && !isScrolled ? "top-10" : "top-3"}`}>
         <div className={`w-full max-w-7xl flex items-center justify-between transition-all duration-300 rounded-2xl ${
           isScrolled
             ? "bg-[#080808]/85 backdrop-blur-2xl border border-white/[0.09] px-5 py-3 shadow-[0_12px_50px_rgba(0,0,0,0.6)]"
@@ -593,7 +823,7 @@ export default function Navbar() {
                     <motion.div layoutId="nav-pill" className="absolute inset-0 bg-white/[0.09] rounded-full"
                       transition={{ type: "spring", stiffness: 350, damping: 32 }} />
                   )}
-                  <span className="relative z-900">{link.name}</span>
+                  <span className="relative z-[901]">{link.name}</span>
                 </button>
               );
             })}
@@ -620,22 +850,22 @@ export default function Navbar() {
                     className={`p-2.5 rounded-xl border transition-all focus-visible:ring-2 focus-visible:ring-blue-500 outline-none ${watchlistOpen ? "bg-blue-500/10 border-blue-500/30 text-blue-400" : "bg-white/[0.04] border-white/[0.07] text-gray-400 hover:bg-white/[0.08] hover:text-white"}`}>
                     <Bookmark size={17} />
                   </motion.button>
-                  <WatchlistPanel open={watchlistOpen} />
+                  <WatchlistPanel open={watchlistOpen} watchlist={watchlist} livePrices={livePrices} />
                 </div>
 
-                {/* Notifications */}
-                <div className="relative" ref={notifRef}>
+                {/* Alerts (Replaced Notifications) */}
+                <div className="relative" ref={alertsRef}>
                   <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
-                    onClick={() => { closeAll(); setNotifOpen(v => !v); }}
-                    className={`relative p-2.5 rounded-xl border transition-all focus-visible:ring-2 focus-visible:ring-blue-500 outline-none ${notifOpen ? "bg-blue-500/10 border-blue-500/30 text-blue-400" : "bg-white/[0.04] border-white/[0.07] text-gray-400 hover:bg-white/[0.08] hover:text-white"}`}>
+                    onClick={() => { closeAll(); setAlertsOpen(v => !v); }}
+                    className={`relative p-2.5 rounded-xl border transition-all focus-visible:ring-2 focus-visible:ring-blue-500 outline-none ${alertsOpen ? "bg-amber-500/10 border-amber-500/30 text-amber-400" : "bg-white/[0.04] border-white/[0.07] text-gray-400 hover:bg-white/[0.08] hover:text-white"}`}>
                     <Bell size={17} />
-                    {unreadCount > 0 && (
+                    {triggeredAlertCount > 0 && (
                       <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 rounded-full border-2 border-[#080808] text-[9px] font-bold flex items-center justify-center text-white">
-                        {unreadCount}
+                        {triggeredAlertCount}
                       </span>
                     )}
                   </motion.button>
-                  <NotificationsPanel open={notifOpen} />
+                  <AlertsPanel open={alertsOpen} alertsStore={alertsStore} onSelectSymbol={handleNavigate} />
                 </div>
 
                 {/* Profile */}
@@ -652,7 +882,7 @@ export default function Navbar() {
                       <Avatar user={user} size={30} />
                     </motion.button>
                   )}
-                  {!loading && user && <ProfileDropdown open={profileOpen} user={user} onClose={() => setProfileOpen(false)} />}
+                  {!loading && user && <ProfileDropdown open={profileOpen} user={user} stats={profileStats} onClose={() => setProfileOpen(false)} />}
                 </div>
               </div>
             ) : loading ? (
@@ -674,13 +904,13 @@ export default function Navbar() {
         </div>
       </header>
 
-      <MobileMenu open={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} user={user} pathname={pathname} />
+      <MobileMenu open={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} user={user} pathname={pathname} watchlist={watchlist} livePrices={livePrices} />
 
       {/* Keyboard hint */}
       <AnimatePresence>
         {!commandOpen && (
           <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ delay: 2 }}
-            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-900 hidden md:flex items-center gap-2 bg-[#0c0c0c]/90 border border-white/[0.08] px-4 py-2 rounded-full text-[11px] text-gray-500 backdrop-blur-xl pointer-events-none">
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[900] hidden md:flex items-center gap-2 bg-[#0c0c0c]/90 border border-white/[0.08] px-4 py-2 rounded-full text-[11px] text-gray-500 backdrop-blur-xl pointer-events-none">
             <Command size={11} /> Press <kbd className="font-mono bg-white/[0.07] px-1.5 py-0.5 rounded border border-white/10">/</kbd> to search
           </motion.div>
         )}

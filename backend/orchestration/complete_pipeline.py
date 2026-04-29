@@ -1,14 +1,6 @@
-"""Complete orchestration pipeline for FinIntel.
-
-This module provides modular entry points that can be used by FastAPI or
-other application layers to run the full stock analysis pipeline.
-
-Public functions:
-    get_technical_result(ticker)
-    get_sentiment_result(ticker)
-    get_fundamental_result(ticker)
-    fuse_and_decide(tech, fund, senti, risk)
-    run_complete_pipeline(ticker)
+"""
+backend/orchestration/complete_pipeline.py
+Optimized pipeline: parallel execution, deduped logic, dead-code removed.
 """
 
 from __future__ import annotations
@@ -16,9 +8,10 @@ from __future__ import annotations
 import importlib
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,6 +29,9 @@ _SENTIMENT_TOKENIZER = None
 _SENTIMENT_CACHE: Dict[str, Dict[str, Any]] = {}
 _SENTIMENT_CACHE_TTL_HOURS = 24
 
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
 
 def _clean_ticker(ticker: str) -> str:
     return str(ticker or "").strip().upper()
@@ -43,50 +39,31 @@ def _clean_ticker(ticker: str) -> str:
 
 def _is_valid_number(value: object) -> bool:
     try:
-        numeric = float(value)
+        n = float(value)
     except (TypeError, ValueError):
         return False
-    return not (math.isnan(numeric) or math.isinf(numeric))
+    return not (math.isnan(n) or math.isinf(n))
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
-        numeric = float(value)
-        if math.isnan(numeric) or math.isinf(numeric):
-            return default
-        return numeric
+        n = float(value)
+        return default if (math.isnan(n) or math.isinf(n)) else n
     except (TypeError, ValueError):
         return default
 
 
 def _to_builtin(value: Any) -> Any:
+    """Recursively convert numpy/pandas scalar types to JSON-safe Python types."""
     if isinstance(value, dict):
         return {k: _to_builtin(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [_to_builtin(v) for v in value]
-
-    if isinstance(value, tuple):
-        return tuple(_to_builtin(v) for v in value)
-
+    if isinstance(value, (list, tuple)):
+        converted = [_to_builtin(v) for v in value]
+        return type(value)(converted)
     if isinstance(value, np.generic):
         value = value.item()
-
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return 0.0
-
-    return value
-    """Recursively convert numpy/pandas scalar types to JSON-safe Python types."""
-
-    if isinstance(value, dict):
-        return {key: _to_builtin(val) for key, val in value.items()}
-    if isinstance(value, list):
-        return [_to_builtin(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_to_builtin(item) for item in value)
-    if isinstance(value, np.generic):
-        return value.item()
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return 0.0
     return value
 
 
@@ -98,55 +75,49 @@ def _load_module(module_path: str):
         return None
 
 
-def _load_yfinance_module():
-    try:
-        return importlib.import_module("yfinance")
-    except Exception as exc:
-        logger.warning("yfinance unavailable in orchestration layer: %s", exc)
-        return None
+# ──────────────────────────────────────────────
+# Price data
+# ──────────────────────────────────────────────
+
+_EMPTY_PRICE_DF = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
 
 def _get_price_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     cache_key = (_clean_ticker(ticker), period)
     if cache_key in _PRICE_CACHE:
-        logger.info("Using cached price data for %s", cache_key[0])
+        logger.debug("Cache hit: price data for %s", cache_key[0])
         return _PRICE_CACHE[cache_key].copy()
 
     logger.info("Fetching price data for %s (%s)", cache_key[0], period)
 
-    stock_feature_module = _load_module("backend.preprocessing.stock_feature_scraper")
-    if stock_feature_module is not None and hasattr(stock_feature_module, "fetch_price_data"):
+    # Try dedicated scraper first
+    stock_mod = _load_module("backend.preprocessing.stock_feature_scraper")
+    if stock_mod and hasattr(stock_mod, "fetch_price_data"):
         try:
-            price_df = stock_feature_module.fetch_price_data(cache_key[0], period=period)
-            if isinstance(price_df, pd.DataFrame) and not price_df.empty:
-                _PRICE_CACHE[cache_key] = price_df.copy()
-                return price_df.copy()
+            df = stock_mod.fetch_price_data(cache_key[0], period=period)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                _PRICE_CACHE[cache_key] = df.copy()
+                return df.copy()
         except Exception as exc:
-            logger.warning("backend.preprocessing.stock_feature_scraper.fetch_price_data failed: %s", exc)
+            logger.warning("stock_feature_scraper.fetch_price_data failed: %s", exc)
 
-    yfinance_module = _load_yfinance_module()
-    if yfinance_module is None:
-        logger.error("No price data source available for %s", cache_key[0])
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-
+    # Fallback to yfinance
     try:
-        price_df = yfinance_module.download(cache_key[0], period=period, progress=False)
-        if isinstance(price_df.columns, pd.MultiIndex):
-            price_df.columns = price_df.columns.get_level_values(0)
-        price_df = price_df[["Open", "High", "Low", "Close", "Volume"]]
-        _PRICE_CACHE[cache_key] = price_df.copy()
-        return price_df.copy()
+        yf = importlib.import_module("yfinance")
+        df = yf.download(cache_key[0], period=period, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        _PRICE_CACHE[cache_key] = df.copy()
+        return df.copy()
     except Exception as exc:
         logger.exception("Price fetch failed for %s: %s", cache_key[0], exc)
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return _EMPTY_PRICE_DF.copy()
 
 
-def _load_technical_model_runner():
-    stock_feature_module = _load_module("backend.preprocessing.stock_feature_scraper")
-    if stock_feature_module is not None and hasattr(stock_feature_module, "run_technical_model"):
-        return stock_feature_module.run_technical_model
-    return None
-
+# ──────────────────────────────────────────────
+# Sentiment model
+# ──────────────────────────────────────────────
 
 def _load_sentiment_model():
     global _SENTIMENT_MODEL, _SENTIMENT_TOKENIZER
@@ -154,82 +125,79 @@ def _load_sentiment_model():
         return _SENTIMENT_TOKENIZER, _SENTIMENT_MODEL
 
     if not SENTIMENT_MODEL_PATH.exists():
-        logger.info("Sentiment model path not found; using fallback sentiment scoring")
+        logger.info("Sentiment model path not found; using fallback scoring")
         return None, None
 
     try:
-        transformers_module = importlib.import_module("transformers")
-        torch_module = importlib.import_module("torch")
+        transformers = importlib.import_module("transformers")
+        torch = importlib.import_module("torch")
     except Exception as exc:
         logger.warning("Sentiment model dependencies unavailable: %s", exc)
         return None, None
 
     try:
-        _SENTIMENT_TOKENIZER = transformers_module.AutoTokenizer.from_pretrained(str(SENTIMENT_MODEL_PATH))
-        _SENTIMENT_MODEL = transformers_module.AutoModelForSequenceClassification.from_pretrained(
+        _SENTIMENT_TOKENIZER = transformers.AutoTokenizer.from_pretrained(str(SENTIMENT_MODEL_PATH))
+        _SENTIMENT_MODEL = transformers.AutoModelForSequenceClassification.from_pretrained(
             str(SENTIMENT_MODEL_PATH)
         )
         _SENTIMENT_MODEL.eval()
-        _SENTIMENT_MODEL.to(torch_module.device("cpu"))
+        _SENTIMENT_MODEL.to(torch.device("cpu"))
         logger.info("Loaded sentiment model from %s", SENTIMENT_MODEL_PATH)
         return _SENTIMENT_TOKENIZER, _SENTIMENT_MODEL
     except Exception as exc:
         logger.warning("Failed to load sentiment model: %s", exc)
-        _SENTIMENT_MODEL = None
-        _SENTIMENT_TOKENIZER = None
+        _SENTIMENT_MODEL = _SENTIMENT_TOKENIZER = None
         return None, None
 
 
 def _fallback_sentiment_score(text: str) -> float:
-    text_lower = text.lower()
-    positive_words = ["beat", "bull", "buy", "growth", "gain", "up", "profit", "strong", "surge"]
-    negative_words = ["bear", "sell", "loss", "down", "risk", "drop", "weak", "concern", "miss"]
-    pos = sum(word in text_lower for word in positive_words)
-    neg = sum(word in text_lower for word in negative_words)
-    score = 0.5 + 0.1 * (pos - neg)
-    return float(np.clip(score, 0.0, 1.0))
+    lower = text.lower()
+    pos = sum(w in lower for w in ["beat", "bull", "buy", "growth", "gain", "up", "profit", "strong", "surge"])
+    neg = sum(w in lower for w in ["bear", "sell", "loss", "down", "risk", "drop", "weak", "concern", "miss"])
+    return float(np.clip(0.5 + 0.1 * (pos - neg), 0.0, 1.0))
 
 
 def _score_sentiment_texts(texts: List[str]) -> List[float]:
-    texts = [str(text).strip() for text in texts if str(text).strip()]
+    texts = [t.strip() for t in map(str, texts) if t.strip()]
     if not texts:
         return []
 
     tokenizer, model = _load_sentiment_model()
     if tokenizer is None or model is None:
-        logger.info("Using fallback sentiment scoring for %d texts", len(texts))
-        return [_fallback_sentiment_score(text) for text in texts]
+        return [_fallback_sentiment_score(t) for t in texts]
 
-    torch_module = importlib.import_module("torch")
+    torch = importlib.import_module("torch")
     scores: List[float] = []
 
-    for text in texts:
-        try:
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-            with torch_module.no_grad():
-                outputs = model(**inputs)
-                logits = outputs.logits[0]
-                probabilities = torch_module.softmax(logits, dim=0).cpu().numpy()
-                score = float(probabilities[2] * 1.0 + probabilities[1] * 0.5 + probabilities[0] * 0.0)
-                scores.append(score)
-        except Exception as exc:
-            logger.warning("Sentiment scoring failed for one item: %s", exc)
-            scores.append(_fallback_sentiment_score(text))
+    # Batch tokenization for speed
+    try:
+        inputs = tokenizer(texts, return_tensors="pt", truncation=True,
+                           max_length=128, padding=True)
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            # [neg=0, neutral=1, pos=2]
+            scores = (probs[:, 2] * 1.0 + probs[:, 1] * 0.5 + probs[:, 0] * 0.0).tolist()
+    except Exception as exc:
+        logger.warning("Batch sentiment scoring failed, falling back item-by-item: %s", exc)
+        for text in texts:
+            try:
+                inp = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+                with torch.no_grad():
+                    logits = model(**inp).logits[0]
+                    p = torch.softmax(logits, dim=0).cpu().numpy()
+                    scores.append(float(p[2] * 1.0 + p[1] * 0.5 + p[0] * 0.0))
+            except Exception:
+                scores.append(_fallback_sentiment_score(text))
 
     return scores
 
 
-def _extract_risk_result(details: Dict[str, Any]) -> Dict[str, Any]:
-    risk = details.get("risk", {}) if isinstance(details, dict) else {}
-    if isinstance(risk, dict):
-        return {
-            "risk_score": _safe_float(risk.get("risk_score", 0.0)),
-            "details": risk,
-        }
-    return {"risk_score": 0.0, "details": {}}
+# ──────────────────────────────────────────────
+# Sentiment cache
+# ──────────────────────────────────────────────
 
-
-def _get_cached_sentiment(ticker: str) -> Dict[str, Any] | None:
+def _get_cached_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
     entry = _SENTIMENT_CACHE.get(ticker)
     if not entry:
         return None
@@ -241,7 +209,8 @@ def _get_cached_sentiment(ticker: str) -> Dict[str, Any] | None:
     return entry
 
 
-def _store_sentiment_cache(ticker: str, sentiment_score: float, num_articles: int, news_volume_score: float) -> None:
+def _store_sentiment_cache(ticker: str, sentiment_score: float,
+                            num_articles: int, news_volume_score: float) -> None:
     _SENTIMENT_CACHE[ticker] = {
         "sentiment_score": float(sentiment_score),
         "num_articles": int(num_articles),
@@ -251,152 +220,141 @@ def _store_sentiment_cache(ticker: str, sentiment_score: float, num_articles: in
 
 
 def _compute_news_volume_score(num_articles: int) -> float:
-    if num_articles <= 0:
-        return 0.0
-    return float(np.clip(num_articles / 20.0, 0.0, 1.0))
+    return float(np.clip(num_articles / 20.0, 0.0, 1.0)) if num_articles > 0 else 0.0
 
+
+# ──────────────────────────────────────────────
+# Individual analysis steps
+# ──────────────────────────────────────────────
 
 def get_technical_result(ticker: str) -> dict:
     """Fetch price data and run the technical model."""
+    cleaned = _clean_ticker(ticker)
+    logger.info("Technical analysis: %s", cleaned)
 
-    cleaned_ticker = _clean_ticker(ticker)
-    logger.info("Starting technical analysis for %s", cleaned_ticker)
-
-    price_df = _get_price_data(cleaned_ticker)
+    price_df = _get_price_data(cleaned)
     if price_df.empty:
-        logger.warning("No price data available for technical analysis: %s", cleaned_ticker)
+        logger.warning("No price data for technical analysis: %s", cleaned)
         return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
 
-    runner = _load_technical_model_runner()
-    if runner is not None:
+    # Try dedicated model runner
+    stock_mod = _load_module("backend.preprocessing.stock_feature_scraper")
+    if stock_mod and hasattr(stock_mod, "run_technical_model"):
         try:
-            result = runner(price_df)
+            result = stock_mod.run_technical_model(price_df)
             if isinstance(result, dict):
-                logger.info("Technical model completed for %s", cleaned_ticker)
+                logger.info("Technical model completed: %s", cleaned)
                 return result
         except Exception as exc:
-            logger.exception("Technical model failed for %s: %s", cleaned_ticker, exc)
+            logger.exception("Technical model failed for %s: %s", cleaned, exc)
 
+    # MA crossover fallback
     try:
-        ma20 = price_df["Close"].rolling(20).mean().iloc[-1]
-        ma50 = price_df["Close"].rolling(50).mean().iloc[-1]
+        close = price_df["Close"]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma50 = close.rolling(50).mean().iloc[-1]
+        diff_pct = abs(ma20 - ma50) / (ma50 + 1e-9)
         score = float(np.clip(0.5 + np.sign(ma20 - ma50) * 0.25, 0.0, 1.0))
         signal = "BUY" if ma20 > ma50 else ("SELL" if ma20 < ma50 else "HOLD")
-        confidence = "high" if abs(ma20 - ma50) / (ma50 + 1e-9) > 0.01 else "medium"
-        logger.info("Technical fallback completed for %s", cleaned_ticker)
+        confidence = "high" if diff_pct > 0.01 else "medium"
+        logger.info("Technical fallback completed: %s", cleaned)
         return {"technical_score": score, "signal": signal, "confidence": confidence}
     except Exception as exc:
-        logger.exception("Technical fallback failed for %s: %s", cleaned_ticker, exc)
+        logger.exception("Technical fallback failed for %s: %s", cleaned, exc)
         return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
 
 
 def get_sentiment_result(ticker: str) -> dict:
     """Fetch news, score each item, and aggregate sentiment."""
+    cleaned = _clean_ticker(ticker)
+    logger.info("Sentiment analysis: %s", cleaned)
 
-    cleaned_ticker = _clean_ticker(ticker)
-    logger.info("Starting sentiment analysis for %s", cleaned_ticker)
+    cached = _get_cached_sentiment(cleaned)
 
-    cached_entry = _get_cached_sentiment(cleaned_ticker)
-
-    news_module = _load_module("backend.scraper.news_scraper")
-    if news_module is None or not hasattr(news_module, "get_news"):
-        logger.warning("News scraper unavailable for %s", cleaned_ticker)
-        return {"sentiment_score": 0.5, "num_articles": 0}
+    news_mod = _load_module("backend.scraper.news_scraper")
+    if news_mod is None or not hasattr(news_mod, "get_news"):
+        logger.warning("News scraper unavailable for %s", cleaned)
+        return {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0, "used_cache": False}
 
     try:
-        news_items = news_module.get_news(cleaned_ticker) or []
+        news_items = news_mod.get_news(cleaned) or []
     except Exception as exc:
-        logger.exception("News fetching failed for %s: %s", cleaned_ticker, exc)
-        return {"sentiment_score": 0.5, "num_articles": 0}
+        logger.exception("News fetch failed for %s: %s", cleaned, exc)
+        return {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0, "used_cache": False}
 
-    texts = []
-    for item in news_items:
-        if isinstance(item, dict):
-            text = str(item.get("text", "")).strip()
-            if text:
-                texts.append(text)
+    texts = [str(item.get("text", "")).strip() for item in news_items
+             if isinstance(item, dict) and str(item.get("text", "")).strip()]
 
-    if not texts:
-        if cached_entry:
-            logger.info("No sentiment data found for %s; reusing cached sentiment", cleaned_ticker)
+    def _cached_fallback(label: str) -> dict:
+        if cached:
+            logger.info("%s for %s; reusing cached sentiment", label, cleaned)
             return {
-                "sentiment_score": float(cached_entry["sentiment_score"]),
-                "num_articles": int(cached_entry["num_articles"]),
-                "news_volume_score": float(cached_entry.get("news_volume_score", 0.0)),
+                "sentiment_score": float(cached["sentiment_score"]),
+                "num_articles": int(cached["num_articles"]),
+                "news_volume_score": float(cached.get("news_volume_score", 0.0)),
                 "used_cache": True,
             }
-        logger.info("No sentiment data found, using neutral fallback")
+        logger.info("%s for %s; using neutral fallback", label, cleaned)
         return {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0, "used_cache": False}
+
+    if not texts:
+        return _cached_fallback("No sentiment texts")
 
     scores = _score_sentiment_texts(texts)
     if not scores:
-        if cached_entry:
-            logger.info("Sentiment scoring empty for %s; reusing cached sentiment", cleaned_ticker)
-            return {
-                "sentiment_score": float(cached_entry["sentiment_score"]),
-                "num_articles": int(cached_entry["num_articles"]),
-                "news_volume_score": float(cached_entry.get("news_volume_score", 0.0)),
-                "used_cache": True,
-            }
-        logger.info("No sentiment data found, using neutral fallback")
-        return {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0, "used_cache": False}
+        return _cached_fallback("Empty sentiment scores")
 
-    base_sentiment_score = float(np.mean(scores))
-    news_volume_score = _compute_news_volume_score(len(texts))
-    sentiment_score = float(np.clip(
-    (0.75 * base_sentiment_score) +
-    (0.25 * news_volume_score),
-    0.0, 1.0
-))
-    _store_sentiment_cache(cleaned_ticker, sentiment_score, len(texts), news_volume_score)
+    base_score = float(np.mean(scores))
+    volume_score = _compute_news_volume_score(len(texts))
+    sentiment_score = float(np.clip(0.75 * base_score + 0.25 * volume_score, 0.0, 1.0))
 
-    logger.info("Sentiment completed for %s with %d articles", cleaned_ticker, len(texts))
+    _store_sentiment_cache(cleaned, sentiment_score, len(texts), volume_score)
+    logger.info("Sentiment completed for %s: %.4f (%d articles)", cleaned, sentiment_score, len(texts))
+
     return {
         "sentiment_score": sentiment_score,
         "num_articles": len(texts),
-        "news_volume_score": news_volume_score,
+        "news_volume_score": volume_score,
         "used_cache": False,
     }
 
 
 def get_fundamental_result(ticker: str) -> dict:
-    """Fetch financial data, compute returns, and run the fundamental pipeline."""
+    """Fetch financial data and run the fundamental pipeline."""
+    cleaned = _clean_ticker(ticker)
+    logger.info("Fundamental analysis: %s", cleaned)
 
-    cleaned_ticker = _clean_ticker(ticker)
-    logger.info("Starting fundamental analysis for %s", cleaned_ticker)
+    fin_mod = _load_module("backend.scraper.fundamental_financial_scraper")
+    fund_mod = _load_module("backend.aggregation.fundamentalFunctions.fundamental_models")
 
-    financial_module = _load_module("backend.scraper.fundamental_financial_scraper")
-    fundamental_module = _load_module("backend.aggregation.fundamentalFunctions.fundamental_models")
-
-    financial_data = {}
-    if financial_module is not None and hasattr(financial_module, "get_financial_data"):
+    financial_data: Dict[str, Any] = {}
+    if fin_mod and hasattr(fin_mod, "get_financial_data"):
         try:
-            financial_data = financial_module.get_financial_data(cleaned_ticker)
+            financial_data = fin_mod.get_financial_data(cleaned)
         except Exception as exc:
-            logger.exception("Financial data fetch failed for %s: %s", cleaned_ticker, exc)
-            financial_data = {}
+            logger.exception("Financial data fetch failed for %s: %s", cleaned, exc)
 
-    if fundamental_module is None or not hasattr(fundamental_module, "run_full_fundamental_pipeline"):
-        logger.warning("Fundamental pipeline unavailable for %s", cleaned_ticker)
+    if fund_mod is None or not hasattr(fund_mod, "run_full_fundamental_pipeline"):
+        logger.warning("Fundamental pipeline unavailable for %s", cleaned)
         return {"fundamental_score": 0.0, "risk_score": 0.0, "details": {}}
 
-    price_df = _get_price_data(cleaned_ticker)
-    if price_df.empty or "Close" not in price_df.columns:
-        logger.warning("No price data available for risk analysis: %s", cleaned_ticker)
-        returns = np.array([], dtype=np.float64)
-    else:
-        returns = price_df["Close"].pct_change().dropna().to_numpy(dtype=np.float64)
+    price_df = _get_price_data(cleaned)
+    returns = (
+        price_df["Close"].pct_change().dropna().to_numpy(dtype=np.float64)
+        if not price_df.empty and "Close" in price_df.columns
+        else np.array([], dtype=np.float64)
+    )
 
     try:
-        pipeline_result = fundamental_module.run_full_fundamental_pipeline(financial_data, returns)
+        pipeline_result = fund_mod.run_full_fundamental_pipeline(financial_data, returns)
     except Exception as exc:
-        logger.exception("Fundamental pipeline failed for %s: %s", cleaned_ticker, exc)
+        logger.exception("Fundamental pipeline failed for %s: %s", cleaned, exc)
         return {"fundamental_score": 0.0, "risk_score": 0.0, "details": {}}
 
     fundamental_score = _safe_float(pipeline_result.get("fundamental", {}).get("fundamental_score", 0.0))
     risk_score = _safe_float(pipeline_result.get("risk", {}).get("risk_score", 0.0))
 
-    logger.info("Fundamental analysis completed for %s", cleaned_ticker)
+    logger.info("Fundamental completed: %s", cleaned)
     return {
         "fundamental_score": fundamental_score,
         "risk_score": risk_score,
@@ -404,115 +362,116 @@ def get_fundamental_result(ticker: str) -> dict:
     }
 
 
-def fuse_and_decide(tech, fund, senti, risk):
-    tech_score = tech.get('technical_score', 0.5)
-    fund_score = fund.get('fundamental_score', 0.0) if isinstance(fund, dict) else 0.0
-    senti_score = senti.get('sentiment_score', 0.5)
-    risk_score = risk.get('risk_score', 0.0)
+# ──────────────────────────────────────────────
+# Fusion
+# ──────────────────────────────────────────────
 
-    # ✅ FIX 1: risk should REDUCE score
-    risk_penalty = 1 - risk_score
+def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[float, str]:
+    tech_score  = _safe_float(tech.get("technical_score"),   0.5)
+    fund_score  = _safe_float(fund.get("fundamental_score"), 0.0)
+    senti_score = _safe_float(senti.get("sentiment_score"),  0.5)
+    risk_score  = _safe_float(risk.get("risk_score"),        0.0)
 
-    # ✅ FIX 2: amplify strong news impact
+    # High risk penalises the final score
+    risk_penalty = 1.0 - risk_score
+
+    # Amplify extreme sentiment
     if senti_score > 0.7:
-        senti_score += 0.1
+        senti_score = min(1.0, senti_score + 0.1)
     elif senti_score < 0.3:
-        senti_score -= 0.1
+        senti_score = max(0.0, senti_score - 0.1)
 
-    senti_score = max(0, min(1, senti_score))
-
-    # ✅ FIX 3: better weights
-    final_score = (
+    final_score = float(np.clip(
         0.35 * tech_score +
         0.35 * fund_score +
         0.25 * senti_score +
-        0.05 * risk_penalty
-    )
-    final_score = float(np.clip(final_score, 0, 1))
-    
-    # ✅ base decision
-    if final_score >= 0.70:
-        decision = 'BUY'
-    elif final_score >= 0.45:
-        decision = 'HOLD'
-    else:
-        decision = 'SELL'
+        0.05 * risk_penalty,
+        0.0, 1.0
+    ))
 
-    # 🔥 FIX 4: NEWS OVERRIDE (VERY IMPORTANT)
+    if final_score >= 0.70:
+        decision = "BUY"
+    elif final_score >= 0.45:
+        decision = "HOLD"
+    else:
+        decision = "SELL"
+
+    # News override for extreme sentiment
     if senti_score < 0.25:
-        decision = 'SELL (Negative News Impact)'
+        decision = "SELL (Negative News Impact)"
     elif senti_score > 0.75:
-        decision = 'BUY (Positive News Momentum)'
+        decision = "BUY (Positive News Momentum)"
 
-    return float(final_score), decision
-    tech_score = tech.get('technical_score', 0.5)
-    fund_score = fund.get('fundamental_score', 0.0) if isinstance(fund, dict) else 0.0
-    senti_score = senti.get('sentiment_score', 0.5)
-    risk_score = risk.get('risk_score', 0.0)
+    return final_score, decision
 
-    final_score = 0.35 * tech_score + 0.30 * fund_score + 0.20 * senti_score + 0.15 * risk_score
 
-    if final_score >= 0.70:
-        decision = 'BUY'
-    elif final_score >= 0.45:
-        decision = 'HOLD'
-    else:
-        decision = 'SELL'
+# ──────────────────────────────────────────────
+# Complete pipeline (parallel)
+# ──────────────────────────────────────────────
 
-    return float(final_score), decision
+def _extract_risk(fundamental: dict) -> dict:
+    details = fundamental.get("details", {})
+    risk_block = details.get("risk", {}) if isinstance(details, dict) else {}
+    risk_score = _safe_float(
+        risk_block.get("risk_score") if isinstance(risk_block, dict) else None,
+        _safe_float(fundamental.get("risk_score", 0.0))
+    )
+    return {"risk_score": risk_score, "details": risk_block}
 
 
 def run_complete_pipeline(ticker: str) -> dict:
-    """Run the full analysis pipeline for a ticker."""
+    """Run the full analysis pipeline for a ticker, with parallel I/O steps."""
+    cleaned = _clean_ticker(ticker)
+    logger.info("Pipeline start: %s", cleaned)
 
-    cleaned_ticker = _clean_ticker(ticker)
-    logger.info("Starting complete pipeline for %s", cleaned_ticker)
+    # Pre-fetch price data once so all sub-steps hit the cache
+    _get_price_data(cleaned)
 
-    technical = {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
-    sentiment = {"sentiment_score": 0.5, "num_articles": 0}
-    fundamental = {"fundamental_score": 0.0, "risk_score": 0.0, "details": {}}
-    risk = {"risk_score": 0.0, "details": {}}
+    defaults = {
+        "technical":  {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"},
+        "sentiment":  {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0},
+        "fundamental": {"fundamental_score": 0.0, "risk_score": 0.0, "details": {}},
+    }
 
-    try:
-        technical = get_technical_result(cleaned_ticker)
-    except Exception as exc:
-        logger.exception("Technical step failed for %s: %s", cleaned_ticker, exc)
+    steps = {
+        "technical":   lambda: get_technical_result(cleaned),
+        "sentiment":   lambda: get_sentiment_result(cleaned),
+        "fundamental": lambda: get_fundamental_result(cleaned),
+    }
 
-    try:
-        sentiment = get_sentiment_result(cleaned_ticker)
-    except Exception as exc:
-        logger.exception("Sentiment step failed for %s: %s", cleaned_ticker, exc)
+    results: Dict[str, dict] = dict(defaults)
 
-    try:
-        fundamental = get_fundamental_result(cleaned_ticker)
-    except Exception as exc:
-        logger.exception("Fundamental step failed for %s: %s", cleaned_ticker, exc)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fn): key for key, fn in steps.items()}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:
+                logger.exception("Step '%s' failed for %s: %s", key, cleaned, exc)
 
-    risk = _extract_risk_result(fundamental.get("details", {}))
-    if not risk.get("risk_score", 0.0):
-        risk = {
-            "risk_score": _safe_float(fundamental.get("risk_score", 0.0)),
-            "details": fundamental.get("details", {}).get("risk", {}) if isinstance(fundamental.get("details", {}), dict) else {},
-        }
+    technical   = results["technical"]
+    sentiment   = results["sentiment"]
+    fundamental = results["fundamental"]
+    risk        = _extract_risk(fundamental)
 
     try:
         final_score, decision = fuse_and_decide(technical, fundamental, sentiment, risk)
     except Exception as exc:
-        logger.exception("Fusion step failed for %s: %s", cleaned_ticker, exc)
+        logger.exception("Fusion failed for %s: %s", cleaned, exc)
         final_score, decision = 0.0, "SELL"
 
-    logger.info("Pipeline completed for %s: %s (%.4f)", cleaned_ticker, decision, final_score)
+    logger.info("Pipeline done: %s → %s (%.4f)", cleaned, decision, final_score)
 
-    result = {
-        "ticker": cleaned_ticker,
-        "technical": technical,
-        "sentiment": sentiment,
+    return _to_builtin({
+        "ticker":      cleaned,
+        "technical":   technical,
+        "sentiment":   sentiment,
         "fundamental": fundamental,
-        "risk": risk,
+        "risk":        risk,
         "final_score": float(final_score),
-        "decision": decision,
-    }
-    return _to_builtin(result)
+        "decision":    decision,
+    })
 
 
 __all__ = [

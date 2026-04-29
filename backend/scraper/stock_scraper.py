@@ -1,369 +1,432 @@
 """
 Stock Data Scraper for FinIntel-Engine
-Fetches OHLCV data from yfinance and adds technical indicators
-Used by technical model for stock classification (Buy/Hold/Sell)
+Fetches OHLCV data from yfinance and adds technical indicators.
+Used by the technical model for stock classification (Buy/Hold/Sell).
+
+Optimizations over v1:
+  - Batch yfinance download (single HTTP round-trip for multiple tickers)
+  - ThreadPoolExecutor for parallel per-ticker feature computation
+  - pandas_ta Strategy (single-pass indicator computation per DataFrame)
+  - Module-level yfinance import (no repeated importlib overhead)
+  - Lazy date defaults computed once at call-time, not instance creation
+  - adx_14 extracted from the ADX result frame instead of a second ta.adx call
 """
 
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import pandas_ta as ta
-from datetime import datetime, timedelta
-import logging
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
+
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────
+
+TECHNICAL_FEATURES: List[str] = [
+    "rsi_5", "rsi_10", "rsi_14", "rsi_15",
+    "roc_10", "mom_10",
+    "STOCHRSIk_14_14_3_3", "STOCHRSId_14_14_3_3",
+    "cci_20", "wr_14",
+    "KST_10_15_20_30_10_10_10_15", "KSTs_9",
+    "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
+    "sma_5", "ema_5", "sma_10", "ema_10", "sma_20", "ema_20",
+    "vwma_20",
+    "BBL_20_2.0_2.0", "BBM_20_2.0_2.0", "BBU_20_2.0_2.0",
+    "BBB_20_2.0_2.0", "BBP_20_2.0_2.0",
+    "KC_20_2", "KCL_20_2", "KCB_20_2", "KCUe_20_2",
+    "adr_14",
+    "obv", "vpt",
+    "ad", "adx_14",
+]
+
+STOCK_LIST: List[str] = [
+    # Tech
+    "AAPL", "MSFT", "NVDA", "AVGO", "ADBE", "CRM", "CSCO", "IBM", "INTC", "INTU",
+    "ORCL", "QCOM", "TXN", "AMD", "NOW", "PLTR", "MU", "PANW", "AMAT", "LRCX",
+    # Internet/Media
+    "GOOGL", "GOOG", "META", "DIS", "NFLX", "T", "VZ", "CMCSA", "TMUS", "CHTR",
+    # Finance
+    "JPM", "BAC", "WFC", "GS", "MS", "AXP", "V", "MA", "BRK-B", "BLK",
+    "C", "COF", "SCHW", "MET", "PYPL",
+    # Healthcare
+    "JNJ", "UNH", "LLY", "ABBV", "PFE", "MRK", "TMO", "ABT", "DHR", "MDT",
+    "GILD", "BMY", "ISRG", "AMGN", "CVS",
+    # Retail/Consumer
+    "AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "TGT", "BKNG",
+    # Industrial
+    "GM", "ABNB", "F", "BA", "CAT", "HON", "GE", "UNP", "UPS", "LMT",
+    "RTX", "FDX", "DE", "MMM", "EMR", "GD",
+    # Consumer Staples
+    "PG", "KO", "PEP", "COST",
+]
+
+# pandas_ta Strategy — computes all indicators in a single pass per DataFrame.
+# Defining it once at module level avoids rebuilding it on every call.
+_TA_STRATEGY = ta.Strategy(
+    name="fintel_38",
+    ta=[
+        {"kind": "rsi",      "length": 5,  "col_names": ("rsi_5",)},
+        {"kind": "rsi",      "length": 10, "col_names": ("rsi_10",)},
+        {"kind": "rsi",      "length": 14, "col_names": ("rsi_14",)},
+        {"kind": "rsi",      "length": 15, "col_names": ("rsi_15",)},
+        {"kind": "roc",      "length": 10, "col_names": ("roc_10",)},
+        {"kind": "mom",      "length": 10, "col_names": ("mom_10",)},
+        {"kind": "stochrsi", "length": 14, "rsi_length": 14, "k": 3, "d": 3},
+        {"kind": "cci",      "length": 20, "col_names": ("cci_20",)},
+        {"kind": "willr",    "length": 14, "col_names": ("wr_14",)},
+        {"kind": "kst",      "roc1": 10, "roc2": 15, "roc3": 20, "roc4": 30,
+                              "signal": 9},
+        {"kind": "macd",     "fast": 12, "slow": 26, "signal": 9},
+        {"kind": "sma",      "length": 5,  "col_names": ("sma_5",)},
+        {"kind": "ema",      "length": 5,  "col_names": ("ema_5",)},
+        {"kind": "sma",      "length": 10, "col_names": ("sma_10",)},
+        {"kind": "ema",      "length": 10, "col_names": ("ema_10",)},
+        {"kind": "sma",      "length": 20, "col_names": ("sma_20",)},
+        {"kind": "ema",      "length": 20, "col_names": ("ema_20",)},
+        {"kind": "vwma",     "length": 20, "col_names": ("vwma_20",)},
+        {"kind": "bbands",   "length": 20, "std": 2.0},
+        {"kind": "kc",       "length": 20, "scalar": 2},
+        {"kind": "atr",      "length": 14, "col_names": ("adr_14",)},
+        {"kind": "obv",      "col_names": ("obv",)},
+        {"kind": "vpt",      "col_names": ("vpt",)},
+        {"kind": "ad",       "col_names": ("ad",)},
+        {"kind": "adx",      "length": 14},
+    ],
+)
+
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+def _default_date_range() -> Tuple[str, str]:
+    today = datetime.now()
+    return (today - timedelta(days=730)).strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+def _flatten_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the ticker level from a MultiIndex column frame returned by yfinance."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def _add_technical_features(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
+    """
+    Compute all 38 technical indicators in a single pandas_ta strategy pass.
+
+    Column-name fixes are applied post-hoc for the few indicators whose
+    default names differ from the model's expected names.
+    """
+    df = df.copy()
+    df.columns = df.columns.str.capitalize()
+
+    # Run every indicator in one pass
+    df.ta.strategy(_TA_STRATEGY)
+
+    # ── Rename columns that pandas_ta names differently from our schema ──
+
+    # StochRSI → STOCHRSIk_14_14_3_3 / STOCHRSId_14_14_3_3
+    srsi_k = next((c for c in df.columns if c.startswith("STOCHRSIk")), None)
+    srsi_d = next((c for c in df.columns if c.startswith("STOCHRSId")), None)
+    if srsi_k and srsi_k != "STOCHRSIk_14_14_3_3":
+        df.rename(columns={srsi_k: "STOCHRSIk_14_14_3_3"}, inplace=True)
+    if srsi_d and srsi_d != "STOCHRSId_14_14_3_3":
+        df.rename(columns={srsi_d: "STOCHRSId_14_14_3_3"}, inplace=True)
+
+    # KST
+    kst_val = next((c for c in df.columns if c.startswith("KST_") and "s" not in c.lower()), None)
+    kst_sig = next((c for c in df.columns if c.startswith("KSTs")), None)
+    if kst_val and kst_val != "KST_10_15_20_30_10_10_10_15":
+        df.rename(columns={kst_val: "KST_10_15_20_30_10_10_10_15"}, inplace=True)
+    if kst_sig and kst_sig != "KSTs_9":
+        df.rename(columns={kst_sig: "KSTs_9"}, inplace=True)
+
+    # MACD: pandas_ta emits MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9 — usually fine.
+
+    # Bollinger Bands: pandas_ta uses BBL_20_2.0, BBM_20_2.0, BBU_20_2.0,
+    # BBB_20_2.0, BBP_20_2.0 — rename to include the trailing "_2.0".
+    for stub, target in [
+        ("BBL_20_2.0", "BBL_20_2.0_2.0"),
+        ("BBM_20_2.0", "BBM_20_2.0_2.0"),
+        ("BBU_20_2.0", "BBU_20_2.0_2.0"),
+        ("BBB_20_2.0", "BBB_20_2.0_2.0"),
+        ("BBP_20_2.0", "BBP_20_2.0_2.0"),
+    ]:
+        if stub in df.columns and target not in df.columns:
+            df.rename(columns={stub: target}, inplace=True)
+
+    # Keltner Channel
+    for stub, target in [
+        ("KCL_20_2", "KCL_20_2"),
+        ("KCM_20_2", "KC_20_2"),
+        ("KCU_20_2", "KCUe_20_2"),
+        ("KCB_20_2", "KCB_20_2"),
+    ]:
+        if stub in df.columns and target not in df.columns:
+            df.rename(columns={stub: target}, inplace=True)
+
+    # ADX: pandas_ta emits ADX_14, DMP_14, DMN_14; we only need adx_14
+    adx_col = next((c for c in df.columns if c.upper().startswith("ADX_")), None)
+    if adx_col and adx_col != "adx_14":
+        df.rename(columns={adx_col: "adx_14"}, inplace=True)
+    # Drop DMP/DMN if present
+    df.drop(columns=[c for c in df.columns if c.startswith(("DMP_", "DMN_"))],
+            inplace=True, errors="ignore")
+
+    logger.debug("Technical features added for %s", ticker or "stock")
+    return df
+
+
+# ──────────────────────────────────────────────
+# Public API — module-level functions
+# (used by complete_pipeline.py via dynamic import)
+# ──────────────────────────────────────────────
+
+def fetch_price_data(ticker: str, period: str = "2y") -> pd.DataFrame:
+    """Fetch raw OHLCV data for a single ticker (pipeline-compatible interface)."""
+    try:
+        df = yf.download(ticker, period=period, progress=False, repair=True)
+        df = _flatten_multiindex(df)
+        if df.empty:
+            logger.warning("No price data for %s", ticker)
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as exc:
+        logger.exception("fetch_price_data failed for %s: %s", ticker, exc)
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+def run_technical_model(price_df: pd.DataFrame) -> Optional[dict]:
+    """
+    Thin shim called by complete_pipeline.run_technical_model.
+    Loads the GRU model and returns {technical_score, signal, confidence}.
+    Returns None to signal the pipeline to use its own fallback.
+    """
+    # Import here to avoid mandatory keras dependency at module load time.
+    try:
+        import json
+        from pathlib import Path
+
+        import numpy as np
+        import tensorflow as tf  # type: ignore
+
+        root = Path(__file__).resolve().parents[2]
+        model_path   = root / "models" / "technical_model" / "gru_stock_classifier-2.keras"
+        feature_path = root / "models" / "technical_model" / "feature_columns.json"
+
+        if not model_path.exists() or not feature_path.exists():
+            return None
+
+        with open(feature_path) as f:
+            feature_cols = json.load(f)
+
+        model = tf.keras.models.load_model(str(model_path))
+
+        df_feat = _add_technical_features(price_df).dropna(subset=feature_cols)
+        if df_feat.empty or len(df_feat) < 30:
+            return None
+
+        X = df_feat[feature_cols].values[-30:].reshape(1, 30, len(feature_cols))
+        probs = model.predict(X, verbose=0)[0]           # [sell, hold, buy]
+        pred  = int(np.argmax(probs))
+        score = float(probs[2])                          # P(BUY)
+        signal_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
+        confidence = "high" if max(probs) > 0.7 else ("medium" if max(probs) > 0.5 else "low")
+
+        return {
+            "technical_score": score,
+            "signal": signal_map[pred],
+            "confidence": confidence,
+            "probabilities": probs.tolist(),
+        }
+    except Exception as exc:
+        logger.warning("run_technical_model failed: %s", exc)
+        return None
+
+
+# ──────────────────────────────────────────────
+# StockScraper class (batch training / data-prep use)
+# ──────────────────────────────────────────────
 
 class StockScraper:
     """
-    Fetches stock data from yfinance and computes technical indicators
-    matching the 38 features used in the technical model.
+    Fetches OHLCV data from yfinance and computes 38 technical indicators.
+
+    For single-ticker lookups the pipeline should call `fetch_price_data`
+    directly.  This class is designed for bulk training-data generation.
     """
-    
-    # Technical features used in the GRU model (from your notebooks)
-    TECHNICAL_FEATURES = [
-        'rsi_5', 'rsi_10', 'rsi_14', 'rsi_15',                           # RSI
-        'roc_10', 'mom_10',                                              # Rate of Change & Momentum
-        'STOCHRSIk_14_14_3_3', 'STOCHRSId_14_14_3_3',                   # Stochastic RSI
-        'cci_20', 'wr_14',                                               # CCI & Williams %R
-        'KST_10_15_20_30_10_10_10_15', 'KSTs_9',                        # KST (Know Sure Thing)
-        'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',               # MACD
-        'sma_5', 'ema_5', 'sma_10', 'ema_10', 'sma_20', 'ema_20',       # Moving Averages
-        'vwma_20',                                                       # Volume Weighted MA
-        'BBL_20_2.0_2.0', 'BBM_20_2.0_2.0', 'BBU_20_2.0_2.0',          # Bollinger Bands
-        'BBB_20_2.0_2.0', 'BBP_20_2.0_2.0',                             # BB Width & %B
-        'KC_20_2', 'KCL_20_2', 'KCB_20_2', 'KCUe_20_2',                 # Keltner Channel
-        'adr_14',                                                        # Average True Range
-        'obv',                                                           # On Balance Volume
-        'vpt',                                                           # Volume Price Trend
-        'ad', 'adx_14'                                                   # Accumulation/Distribution
-    ]
-    
-    STOCK_LIST = [
-        # Tech stocks
-        "AAPL", "MSFT", "NVDA", "AVGO", "ADBE", "CRM", "CSCO", "IBM", "INTC", "INTU",
-        "ORCL", "QCOM", "TXN", "AMD", "NOW", "PLTR", "MU", "PANW", "AMAT", "LRCX",
-        
-        # Internet/Media
-        "GOOGL", "GOOG", "META", "DIS", "NFLX", "T", "VZ", "CMCSA", "TMUS", "CHTR",
-        
-        # Finance
-        "JPM", "BAC", "WFC", "GS", "MS", "AXP", "V", "MA", "BRK-B", "BLK",
-        "C", "COF", "SCHW", "MET", "PYPL",
-        
-        # Healthcare
-        "JNJ", "UNH", "LLY", "ABBV", "PFE", "MRK", "TMO", "ABT", "DHR", "MDT",
-        "GILD", "BMY", "ISRG", "AMGN", "CVS",
-        
-        # Retail/Consumer
-        "AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "TGT", "BKNG",
-        
-        # Industrial
-        "GM", "ABNB", "F", "BA", "CAT", "HON", "GE", "UNP", "UPS", "LMT",
-        "RTX", "FDX", "DE", "MMM", "EMR", "GD",
-        
-        # Consumer Staples
-        "PG", "KO", "PEP", "COST"
-    ]
-    
-    def __init__(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
-        """
-        Initialize scraper with date range.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD). Defaults to 2 years ago.
-            end_date: End date (YYYY-MM-DD). Defaults to today.
-        """
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y-%m-%d")
-        
-        if start_date is None:
-            start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        
-        self.start_date = start_date
-        self.end_date = end_date
-        self.data_cache = {}
-        
-        logger.info(f"Scraper initialized: {start_date} to {end_date}")
-    
-    def fetch_stock_data(self, ticker: str, progress: bool = True) -> Optional[pd.DataFrame]:
-        """
-        Fetch OHLCV data for a single stock.
-        
-        Args:
-            ticker: Stock ticker symbol
-            progress: Show download progress
-            
-        Returns:
-            DataFrame with OHLCV data or None if error
-        """
+
+    TECHNICAL_FEATURES = TECHNICAL_FEATURES
+    STOCK_LIST         = STOCK_LIST
+
+    def __init__(
+        self,
+        start_date: Optional[str] = None,
+        end_date:   Optional[str] = None,
+        max_workers: int = 8,
+    ) -> None:
+        default_start, default_end = _default_date_range()
+        self.start_date  = start_date or default_start
+        self.end_date    = end_date   or default_end
+        self.max_workers = max_workers
+        self._cache: Dict[str, pd.DataFrame] = {}
+        logger.info("StockScraper initialised: %s → %s", self.start_date, self.end_date)
+
+    # ── Fetching ──────────────────────────────
+
+    def fetch_stock_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Fetch OHLCV for one ticker (single HTTP call)."""
+        if ticker in self._cache:
+            return self._cache[ticker].copy()
         try:
-            logger.info(f"Fetching data for {ticker}...")
-            data = yf.download(
+            df = yf.download(
                 ticker,
                 start=self.start_date,
                 end=self.end_date,
-                progress=progress,
-                repair=True
+                progress=False,
+                repair=True,
             )
-            
-            if data.empty:
-                logger.warning(f"No data found for {ticker}")
+            df = _flatten_multiindex(df)
+            if df.empty:
+                logger.warning("No data for %s", ticker)
                 return None
-            
-            # Add ticker column for tracking
-            data['Ticker'] = ticker
-            self.data_cache[ticker] = data
-            
-            logger.info(f"Successfully fetched {len(data)} rows for {ticker}")
-            return data
-            
-        except Exception as e:
-            logger.error(f"Error fetching {ticker}: {str(e)}")
+            df["Ticker"] = ticker
+            self._cache[ticker] = df
+            logger.info("Fetched %d rows for %s", len(df), ticker)
+            return df.copy()
+        except Exception as exc:
+            logger.error("Error fetching %s: %s", ticker, exc)
             return None
-    
-    def fetch_multiple_stocks(self, tickers: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+
+    def fetch_multiple_stocks(
+        self, tickers: Optional[List[str]] = None
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Fetch data for multiple stocks.
-        
-        Args:
-            tickers: List of ticker symbols. Defaults to STOCK_LIST.
-            
-        Returns:
-            Dictionary of {ticker: dataframe}
+        Batch-download multiple tickers in a *single* yfinance call,
+        then split the result per ticker.  Falls back to per-ticker
+        downloads for any tickers that return no data.
         """
-        if tickers is None:
-            tickers = self.STOCK_LIST
-        
-        data = {}
-        for ticker in tickers:
-            df = self.fetch_stock_data(ticker, progress=False)
-            if df is not None:
-                data[ticker] = df
-        
-        logger.info(f"Successfully fetched data for {len(data)}/{len(tickers)} stocks")
-        return data
-    
+        tickers = tickers or self.STOCK_LIST
+        uncached = [t for t in tickers if t not in self._cache]
+
+        if uncached:
+            try:
+                raw = yf.download(
+                    uncached,
+                    start=self.start_date,
+                    end=self.end_date,
+                    progress=False,
+                    repair=True,
+                    group_by="ticker",
+                )
+                for ticker in uncached:
+                    try:
+                        df = raw[ticker].dropna(how="all")
+                        if not df.empty:
+                            df = _flatten_multiindex(df.copy())
+                            df["Ticker"] = ticker
+                            self._cache[ticker] = df
+                    except KeyError:
+                        pass  # will retry individually below
+            except Exception as exc:
+                logger.warning("Batch download failed, retrying individually: %s", exc)
+
+            # Retry any still-missing tickers individually
+            missing = [t for t in uncached if t not in self._cache]
+            for ticker in missing:
+                self.fetch_stock_data(ticker)
+
+        result = {t: self._cache[t].copy() for t in tickers if t in self._cache}
+        logger.info("Fetched %d/%d tickers", len(result), len(tickers))
+        return result
+
+    # ── Feature computation ───────────────────
+
     @staticmethod
-    def add_technical_features(df: pd.DataFrame, 
-                              ticker: Optional[str] = None) -> pd.DataFrame:
-        """
-        Add all 38 technical indicators to OHLCV data.
-        
-        Args:
-            df: DataFrame with OHLCV data
-            ticker: Stock ticker (for logging)
-            
-        Returns:
-            DataFrame with technical indicators added
-        """
-        try:
-            df = df.copy()
-            
-            # Ensure proper column names
-            df.columns = df.columns.str.capitalize()
-            
-            # Calculate all technical indicators using pandas_ta
-            
-            # 1. RSI (Relative Strength Index)
-            df['rsi_5'] = ta.rsi(df['Close'], length=5)
-            df['rsi_10'] = ta.rsi(df['Close'], length=10)
-            df['rsi_14'] = ta.rsi(df['Close'], length=14)
-            df['rsi_15'] = ta.rsi(df['Close'], length=15)
-            
-            # 2. Rate of Change & Momentum
-            df['roc_10'] = ta.roc(df['Close'], length=10)
-            df['mom_10'] = ta.mom(df['Close'], length=10)
-            
-            # 3. Stochastic RSI
-            stoch_rsi = ta.stochrsi(df['Close'], length=14, rsi_length=14, k=3, d=3)
-            if stoch_rsi is not None:
-                df['STOCHRSIk_14_14_3_3'] = stoch_rsi.iloc[:, 0]
-                df['STOCHRSId_14_14_3_3'] = stoch_rsi.iloc[:, 1]
-            
-            # 4. CCI (Commodity Channel Index) & Williams %R
-            df['cci_20'] = ta.cci(df['High'], df['Low'], df['Close'], length=20)
-            df['wr_14'] = ta.willr(df['High'], df['Low'], df['Close'], length=14)
-            
-            # 5. KST (Know Sure Thing)
-            kst = ta.kst(df['Close'], length=[10, 15, 20, 30], signal=9)
-            if kst is not None:
-                df['KST_10_15_20_30_10_10_10_15'] = kst.iloc[:, 0]
-                df['KSTs_9'] = kst.iloc[:, 1]
-            
-            # 6. MACD (Moving Average Convergence Divergence)
-            macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-            if macd is not None:
-                df['MACD_12_26_9'] = macd.iloc[:, 0]
-                df['MACDh_12_26_9'] = macd.iloc[:, 2]
-                df['MACDs_12_26_9'] = macd.iloc[:, 1]
-            
-            # 7. Moving Averages
-            df['sma_5'] = ta.sma(df['Close'], length=5)
-            df['ema_5'] = ta.ema(df['Close'], length=5)
-            df['sma_10'] = ta.sma(df['Close'], length=10)
-            df['ema_10'] = ta.ema(df['Close'], length=10)
-            df['sma_20'] = ta.sma(df['Close'], length=20)
-            df['ema_20'] = ta.ema(df['Close'], length=20)
-            
-            # 8. Volume Weighted Moving Average
-            df['vwma_20'] = ta.vwma(df['Close'], df['Volume'], length=20)
-            
-            # 9. Bollinger Bands
-            bb = ta.bbands(df['Close'], length=20, std=2.0)
-            if bb is not None:
-                df['BBL_20_2.0_2.0'] = bb.iloc[:, 0]
-                df['BBM_20_2.0_2.0'] = bb.iloc[:, 1]
-                df['BBU_20_2.0_2.0'] = bb.iloc[:, 2]
-                df['BBB_20_2.0_2.0'] = bb.iloc[:, 3]
-                df['BBP_20_2.0_2.0'] = bb.iloc[:, 4]
-            
-            # 10. Keltner Channels
-            kc = ta.kc(df['High'], df['Low'], df['Close'], length=20, scalar=2)
-            if kc is not None:
-                df['KC_20_2'] = kc.iloc[:, 1]
-                df['KCL_20_2'] = kc.iloc[:, 0]
-                df['KCB_20_2'] = kc.iloc[:, 3]
-                df['KCUe_20_2'] = kc.iloc[:, 2]
-            
-            # 11. Average True Range
-            df['adr_14'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            
-            # 12. Volume Indicators
-            df['obv'] = ta.obv(df['Close'], df['Volume'])
-            df['vpt'] = ta.vpt(df['Close'], df['Volume'])
-            
-            # 13. Accumulation/Distribution
-            df['ad'] = ta.ad(df['High'], df['Low'], df['Close'], df['Volume'])
-            df['adx_14'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-            
-            logger.info(f"Technical features added for {ticker or 'stock'}")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error adding technical features: {str(e)}")
-            return df
-    
+    def add_technical_features(
+        df: pd.DataFrame, ticker: Optional[str] = None
+    ) -> pd.DataFrame:
+        return _add_technical_features(df, ticker or "")
+
+    # ── Combined fetch + features ─────────────
+
     def process_stock(self, ticker: str) -> Optional[pd.DataFrame]:
-        """
-        Fetch and process a single stock (fetch + add features).
-        
-        Args:
-            ticker: Stock ticker symbol
-            
-        Returns:
-            DataFrame with OHLCV + technical features
-        """
         df = self.fetch_stock_data(ticker)
-        if df is not None:
-            df = self.add_technical_features(df, ticker)
-        return df
-    
-    def process_multiple_stocks(self, tickers: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+        return _add_technical_features(df, ticker) if df is not None else None
+
+    def process_multiple_stocks(
+        self, tickers: Optional[List[str]] = None
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Process multiple stocks in batch.
-        
-        Args:
-            tickers: List of ticker symbols
-            
-        Returns:
-            Dictionary of processed dataframes
+        Batch-fetch all tickers (one HTTP call), then compute indicators
+        for each ticker in parallel using a thread pool.
         """
-        if tickers is None:
-            tickers = self.STOCK_LIST
-        
-        processed_data = {}
-        for ticker in tickers:
-            df = self.process_stock(ticker)
-            if df is not None:
-                processed_data[ticker] = df
-        
-        return processed_data
-    
-    def save_to_csv(self, data: Dict[str, pd.DataFrame], output_dir: str = "stock_data"):
-        """
-        Save processed data to CSV files.
-        
-        Args:
-            data: Dictionary of {ticker: dataframe}
-            output_dir: Directory to save files
-        """
-        import os
+        tickers = tickers or self.STOCK_LIST
+        raw_data = self.fetch_multiple_stocks(tickers)
+
+        processed: Dict[str, pd.DataFrame] = {}
+
+        def _compute(ticker: str, df: pd.DataFrame):
+            return ticker, _add_technical_features(df, ticker)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(_compute, t, df): t
+                for t, df in raw_data.items()
+            }
+            for future in as_completed(futures):
+                try:
+                    ticker, result_df = future.result()
+                    processed[ticker] = result_df
+                except Exception as exc:
+                    logger.error("Feature computation failed for %s: %s",
+                                 futures[future], exc)
+
+        logger.info("Processed %d/%d tickers", len(processed), len(tickers))
+        return processed
+
+    # ── I/O ──────────────────────────────────
+
+    def save_to_csv(
+        self, data: Dict[str, pd.DataFrame], output_dir: str = "stock_data"
+    ) -> None:
         os.makedirs(output_dir, exist_ok=True)
-        
         for ticker, df in data.items():
-            filepath = os.path.join(output_dir, f"{ticker}_data.csv")
-            df.to_csv(filepath)
-            logger.info(f"Saved {ticker} to {filepath}")
-    
+            path = os.path.join(output_dir, f"{ticker}_data.csv")
+            df.to_csv(path)
+            logger.info("Saved %s → %s", ticker, path)
+
     def get_cached_data(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Get cached data for a ticker."""
-        return self.data_cache.get(ticker)
+        return self._cache.get(ticker)
 
 
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
+# ──────────────────────────────────────────────
+# CLI demo
+# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    
-    # Example 1: Fetch and process a single stock
-    print("=" * 80)
-    print("Example 1: Single Stock")
-    print("=" * 80)
-    
-    scraper = StockScraper(
-        start_date="2022-01-01",
-        end_date="2024-12-31"
-    )
-    
-    aapl_data = scraper.process_stock("AAPL")
-    if aapl_data is not None:
-        print(f"\nShape: {aapl_data.shape}")
-        print(f"\nColumns: {list(aapl_data.columns)}")
-        print(f"\nFirst few rows:\n{aapl_data.head()}")
-    
-    
-    # Example 2: Fetch multiple stocks
-    print("\n" + "=" * 80)
-    print("Example 2: Multiple Stocks")
-    print("=" * 80)
-    
-    stock_list = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-    data = scraper.fetch_multiple_stocks(stock_list)
-    print(f"\nFetched data for {len(data)} stocks")
-    
-    
-    # Example 3: Add features and save
-    print("\n" + "=" * 80)
-    print("Example 3: Process and Save")
-    print("=" * 80)
-    
-    processed = {}
-    for ticker, df in data.items():
-        processed[ticker] = scraper.add_technical_features(df, ticker)
-    
-    scraper.save_to_csv(processed, output_dir="backend/datasets/technical_datset/raw_data")
-    
-    
-    # Example 4: Access OHLCV and technical features separately
-    print("\n" + "=" * 80)
-    print("Example 4: Feature Extraction")
-    print("=" * 80)
-    
-    sample_df = processed["AAPL"]
-    
-    # OHLCV columns
-    ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    ohlcv_data = sample_df[ohlcv_cols]
-    
-    # Technical features (38 features for model input)
-    technical_cols = StockScraper.TECHNICAL_FEATURES
-    technical_data = sample_df[technical_cols].dropna()
-    
-    print(f"\nOHLCV Data Shape: {ohlcv_data.shape}")
-    print(f"Technical Features Shape: {technical_data.shape}")
-    print(f"\nSample Technical Features:\n{technical_data.head()}")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    scraper = StockScraper(start_date="2022-01-01", end_date="2024-12-31")
+
+    print("\n── Single stock ──")
+    aapl = scraper.process_stock("AAPL")
+    if aapl is not None:
+        print(f"Shape: {aapl.shape}")
+        print(aapl[TECHNICAL_FEATURES].tail(3))
+
+    print("\n── Batch (5 tickers) ──")
+    batch = scraper.process_multiple_stocks(["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"])
+    print(f"Processed {len(batch)} tickers")
+
+    print("\n── Save ──")
+    scraper.save_to_csv(batch, output_dir="backend/datasets/technical_dataset/raw_data")

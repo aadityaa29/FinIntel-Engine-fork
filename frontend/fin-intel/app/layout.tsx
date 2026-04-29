@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import NavbarWrapper from "@/components/NavbarWrapper"; // 🔥 Changed import
+import NavbarWrapper from "@/components/NavbarWrapper"; 
 import Providers from "./providers";
 import { Toaster } from "react-hot-toast";
 
@@ -26,16 +26,15 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
+    // Add suppressHydrationWarning right here!
     <html
       lang="en"
+      suppressHydrationWarning 
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-       
         <Providers>
-
           <NavbarWrapper />
-
           <Toaster
             position="bottom-right"
             toastOptions={{
