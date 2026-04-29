@@ -991,6 +991,27 @@ export default function Home() {
           />
           <InsightsPanel data={activeInsightsData} isLoading={isMarketLoading} />
         </motion.div>
+        
+        <footer className="bg-gray-900 text-gray-300 py-6 mt-10 border-t border-gray-800">
+      <div className="max-w-7xl mx-auto px-4 flex flex-col md:flex-row items-center justify-between gap-3">
+
+        {/* Left */}
+        <p className="text-sm">
+          © {new Date().getFullYear()}{" "}
+          <span className="text-white font-semibold">FinIntel</span>. All rights reserved.
+        </p>
+
+        {/* Right */}
+        <p className="text-sm text-gray-400 text-center md:text-right">
+          Made by{" "}
+          <span className="text-white font-medium">Aditya Pachouri</span>,{" "}
+          <span className="text-white font-medium">Rishabh Kapur</span>,{" "}
+          <span className="text-white font-medium">Aditya Pratap Singh</span>
+        </p>
+
+      </div>
+    </footer>
+
 
       </div>
     </main>

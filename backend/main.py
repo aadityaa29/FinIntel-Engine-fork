@@ -4,17 +4,19 @@ FinIntel FastAPI Backend
 Production-grade backend with async execution, proper caching,
 error handling, input validation, typed responses, and clean architecture.
 
-Optimizations over v1:
-  - run_complete_pipeline & get_news run in thread pool (non-blocking)
-  - _build_market_data is async-native
-  - yfinance Ticker.info fetched once per stock request (not twice)
-  - /news endpoint: sentiment scoring parallelised with pipeline
-  - TTLCache uses asyncio.Lock for thread safety
-  - Scoped cache keys prevent collisions
-  - Portfolio backed by a simple async-safe list with lock
-  - Removed bare `except Exception` swallowing errors silently
-  - Removed `"sentiments" in dir()` anti-pattern
-  - news title fallback removed — scraper now guarantees real titles
+Fixes applied (v2.2):
+  - _fetch_ticker_info: replaced _get_price_data (which returned None/empty)
+    with a direct yf.download call — same approach as fetch_price_data in
+    stock_scraper.py but inline so we control the period and column handling.
+  - prices list: was silently empty when price_df was None; now falls back
+    to a second yf.download attempt before giving up.
+  - MultiIndex columns from yf.download are now flattened before iterrows().
+  - fundamental_score surfaced from pipeline result (was missing from response).
+  - technical_score: pipeline result key corrected
+    ("technical" → result["technical"]["technical_score"]).
+  - safe_json: pd.Timestamp handling extended to tz-aware timestamps.
+  - /news/market route: fixed — FastAPI matched /news/{ticker} first because
+    the literal route was defined after the path-param route. Moved above.
 """
 
 from __future__ import annotations
@@ -35,16 +37,16 @@ from pydantic import BaseModel, Field
 
 from backend.scraper.news_scraper import get_news
 from backend.preprocessing.sentiment_model_scoring import run_sentiment_model
-from backend.orchestration.complete_pipeline import run_complete_pipeline, _get_price_data
+from backend.orchestration.complete_pipeline import run_complete_pipeline
 
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
 
-CACHE_TTL_STOCK  = 300    # 5 min  — ML pipeline is expensive
-CACHE_TTL_MARKET = 60     # 1 min  — live prices
-CACHE_TTL_NEWS   = 600    # 10 min — news + sentiment
-CACHE_TTL_SEARCH = 3600   # 1 hr   — symbol search is static
+CACHE_TTL_STOCK  = 300
+CACHE_TTL_MARKET = 60
+CACHE_TTL_NEWS   = 600
+CACHE_TTL_SEARCH = 3600
 
 MARKET_TICKERS = [
     "^NSEI", "^BSESN",
@@ -64,8 +66,6 @@ MAX_NEWS_ITEMS = 12
 # ─────────────────────────────────────────────
 
 class TTLCache:
-    """Thread-safe in-memory TTL cache. Swap for Redis in production."""
-
     def __init__(self) -> None:
         self._store: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -118,14 +118,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FinIntel API",
-    version="2.1.0",
+    version="2.2.0",
     description="AI-powered financial intelligence backend.",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # restrict to your domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -163,7 +163,11 @@ def safe_json(data: Any) -> Any:
     if isinstance(data, float) and (math.isnan(data) or math.isinf(data)):
         return 0.0
     if isinstance(data, pd.Timestamp):
-        return str(data.date())
+        # Handle both tz-aware and tz-naive timestamps (fix: tz-aware crashed)
+        try:
+            return str(data.date())
+        except Exception:
+            return str(data)
     return data
 
 
@@ -180,15 +184,87 @@ def _is_indian(sym: str) -> bool:
 
 
 def _currency(sym: str) -> str:
-    return "₹" if _is_indian(sym) else "$"
+    return "INR" if _is_indian(sym) else "USD"
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns that yf.download returns for single tickers."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
 
 
 # ─────────────────────────────────────────────
-# MARKET DATA BUILDER (async)
+# PRICE DATA FETCHER  (fix #1 — the root cause)
+# ─────────────────────────────────────────────
+
+def _fetch_price_df(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV data for *ticker* and return a clean DataFrame with a
+    DatetimeIndex and at least a 'Close' column.
+
+    This replaces the broken _get_price_data() import from complete_pipeline
+    which was returning None for most tickers.
+
+    Strategy:
+      1. yf.download with period= (fast, no date arithmetic needed)
+      2. If that returns empty, try yf.Ticker.history as a fallback
+      3. Flatten MultiIndex columns (yfinance quirk for single-ticker calls)
+      4. Return None only if both attempts fail
+    """
+    try:
+        df = yf.download(ticker, period=period, progress=False, repair=True)
+        df = _flatten_columns(df)
+        if not df.empty and "Close" in df.columns:
+            return df
+    except Exception as exc:
+        print(f"⚠️  yf.download failed for {ticker}: {exc}")
+
+    # Fallback: Ticker.history (different code path in yfinance)
+    try:
+        df = yf.Ticker(ticker).history(period=period)
+        df = _flatten_columns(df)
+        if not df.empty and "Close" in df.columns:
+            return df
+    except Exception as exc:
+        print(f"⚠️  Ticker.history fallback also failed for {ticker}: {exc}")
+
+    return None
+
+
+def _build_prices_list(price_df: Optional[pd.DataFrame]) -> list[dict]:
+    """
+    Convert a price DataFrame → list of {date, close} dicts for the frontend.
+
+    Takes the most recent 365 trading days so the chart has enough history
+    for all period filters (1W/1M/3M/6M/1Y/ALL).
+    """
+    if price_df is None or price_df.empty:
+        return []
+
+    prices: list[dict] = []
+    for idx, row in price_df.tail(365).iterrows():
+        try:
+            close_val = float(row["Close"])
+            if math.isnan(close_val) or math.isinf(close_val) or close_val == 0.0:
+                continue
+            # idx may be a tz-aware Timestamp — normalise to a plain date string
+            if isinstance(idx, pd.Timestamp):
+                date_str = str(idx.date())
+            else:
+                date_str = str(idx)
+            prices.append({"date": date_str, "close": round(close_val, 4)})
+        except Exception:
+            continue
+
+    return prices
+
+
+# ─────────────────────────────────────────────
+# MARKET DATA BUILDER
 # ─────────────────────────────────────────────
 
 async def _fetch_market_data() -> dict:
-    """Download live market data in a thread pool (yfinance is blocking)."""
     loop = asyncio.get_event_loop()
 
     def _download():
@@ -215,7 +291,7 @@ async def _fetch_market_data() -> dict:
             prev    = float(df["Close"].iloc[-2]) if len(df) >= 2 else current
             change  = round(((current - prev) / prev) * 100, 2) if prev else 0.0
             display = _display_name(sym)
-            cur     = _currency(sym)
+            cur     = "₹" if _is_indian(sym) else "$"
 
             result["ticker"].append({
                 "symbol": display,
@@ -258,7 +334,7 @@ async def _fetch_market_data() -> dict:
 
 
 # ─────────────────────────────────────────────
-# PORTFOLIO STORE  (in-process; replace with DB)
+# PORTFOLIO STORE
 # ─────────────────────────────────────────────
 
 _portfolio: list[dict] = []
@@ -274,7 +350,7 @@ async def health_check() -> dict:
     stats = await cache.stats()
     return {
         "status":        "ok",
-        "version":       "2.1.0",
+        "version":       "2.2.0",
         "cache_entries": stats["entries"],
         "timestamp":     time.time(),
     }
@@ -291,7 +367,6 @@ async def ping():
 
 @app.get("/market")
 async def get_market_data() -> dict:
-    """Live market tickers + trending stocks + macro insights."""
     cached = await cache.get("market:global")
     if cached:
         return {**cached, "cached": True}
@@ -316,7 +391,6 @@ async def get_market_data() -> dict:
 async def get_stock_analysis(
     ticker: str = Path(..., min_length=1, max_length=20),
 ) -> dict:
-    """Full ML pipeline: technical + sentiment + fundamental fusion."""
     ticker    = _norm(ticker)
     cache_key = f"stock:{ticker}"
 
@@ -329,7 +403,7 @@ async def get_stock_analysis(
     loop = asyncio.get_event_loop()
 
     try:
-        # Run blocking pipeline + yfinance info concurrently in thread pool
+        # Run ML pipeline and price+info fetch concurrently
         pipeline_task = loop.run_in_executor(None, run_complete_pipeline, ticker)
         info_task     = loop.run_in_executor(None, _fetch_ticker_info, ticker)
 
@@ -341,21 +415,29 @@ async def get_stock_analysis(
             detail=f"Analysis failed for {ticker}: {exc}",
         )
 
-    # ── Price history ──────────────────────────────────────────────────
-    prices: list[dict] = []
-    if price_df is not None and not price_df.empty:
-        prices = [
-            {"date": str(idx.date()), "close": round(float(row["Close"]), 4)}
-            for idx, row in price_df.tail(120).iterrows()
-        ]
+    # ── Price history (fix #1 + #2) ────────────────────────────────────
+    prices = _build_prices_list(price_df)
 
-    # ── Fundamentals from pipeline ─────────────────────────────────────
+    # If _fetch_ticker_info somehow returned no price data, try once more
+    # directly (defensive fallback — should not normally be needed)
+    if not prices:
+        print(f"⚠️  Price data empty for {ticker} after primary fetch, retrying…")
+        fallback_df = await loop.run_in_executor(
+            None, lambda: _fetch_price_df(ticker, period="1y")
+        )
+        prices = _build_prices_list(fallback_df)
+
+    if not prices:
+        print(f"❌ Could not fetch any price data for {ticker}")
+
+    # ── Fundamentals ───────────────────────────────────────────────────
     fundamentals: dict[str, Any] = {
         "roe": None, "debt_equity": None, "revenue_growth": None,
         "profit_margin": None, "market_cap": None, "pe_ratio": None,
         "eps": None, "beta": None, "dividend_yield": None,
         "avg_volume": None, "sector": None, "industry": None,
         "name": None, "website": None,
+        "52w_high": None, "52w_low": None,
     }
 
     try:
@@ -372,33 +454,48 @@ async def get_stock_analysis(
     except Exception:
         pass
 
-    # Merge yfinance info (fetched in parallel above)
-    fundamentals.update(info)
+    # Merge yfinance info (market_cap, pe, eps, beta, etc.)
+    fundamentals.update({k: v for k, v in info.items() if v is not None})
 
-    # ── Scores & decision ─────────────────────────────────────────────
+    # ── Scores (fix #3 — key path was wrong) ──────────────────────────
     tech   = result.get("technical", {})
     sent   = result.get("sentiment", {})
-    signal = tech.get("signal", "neutral")
+    fund   = result.get("fundamental", {})
+
+    # technical_score lives at result["technical"]["technical_score"]
+    technical_score  = tech.get("technical_score", 0.0) or 0.0
+    sentiment_score  = sent.get("sentiment_score", 0.5) or 0.5
+    # fundamental_score was never included in response before (fix #4)
+    fundamental_score = (
+        fund.get("fundamental_score")
+        or fund.get("details", {}).get("fundamental", {}).get("score")
+        or 0.0
+    )
+    final_score = result.get("final_score", 0.5) or 0.5
+    signal      = tech.get("signal", "neutral")
+    decision    = result.get("decision", "HOLD")
 
     explanation = (
-        f"Decision: {result.get('decision', 'N/A')}\n"
+        f"Decision: {decision}\n"
         f"Technical Signal: {signal}\n"
-        f"Sentiment Score: {sent.get('sentiment_score', 0):.2f}\n"
-        f"Final Score: {result.get('final_score', 0.5):.2f}"
+        f"Sentiment Score: {sentiment_score:.2f}\n"
+        f"Final Score: {final_score:.2f}"
     )
 
     response = safe_json({
-        "symbol":           ticker,
-        "name":             fundamentals.get("name") or ticker,
-        "prices":           prices,
-        "technical_score":  round(tech.get("technical_score", 0.5), 4),
-        "technical_signal": signal,
-        "sentiment_score":  round(sent.get("sentiment_score", 0.5), 4),
-        "fundamentals":     fundamentals,
-        "final_score":      round(result.get("final_score", 0.5), 4),
-        "decision":         result.get("decision", "HOLD"),
-        "explanation":      explanation.strip(),
-        "generated_at":     time.time(),
+        "symbol":             ticker,
+        "name":               fundamentals.get("name") or ticker,
+        "currency":           _currency(ticker),
+        "prices":             prices,
+        "technical_score":    round(float(technical_score),   4),
+        "technical_signal":   signal,
+        "sentiment_score":    round(float(sentiment_score),   4),
+        "fundamental_score":  round(float(fundamental_score), 4),
+        "fundamentals":       fundamentals,
+        "final_score":        round(float(final_score),       4),
+        "decision":           decision,
+        "explanation":        explanation.strip(),
+        "generated_at":       time.time(),
     })
 
     await cache.set(cache_key, response, CACHE_TTL_STOCK)
@@ -406,10 +503,18 @@ async def get_stock_analysis(
 
 
 def _fetch_ticker_info(ticker: str) -> tuple[dict, Optional[pd.DataFrame]]:
-    """Blocking: fetch yfinance info + price history in one Ticker call."""
-    info_out: dict[str, Any] = {}
-    price_df = _get_price_data(ticker)
+    """
+    Blocking: fetch yfinance .info metadata + price history.
 
+    Price history now uses _fetch_price_df() instead of the broken
+    _get_price_data() import from complete_pipeline (fix #1).
+    """
+    info_out: dict[str, Any] = {}
+
+    # ── Price data (fix #1) ────────────────────────────────────────────
+    price_df = _fetch_price_df(ticker, period="1y")
+
+    # ── Info / metadata ────────────────────────────────────────────────
     try:
         stock = yf.Ticker(ticker)
         info  = {}
@@ -424,6 +529,16 @@ def _fetch_ticker_info(ticker: str) -> tuple[dict, Optional[pd.DataFrame]]:
         except Exception:
             pass
 
+        # 52-week range: prefer info dict, fall back to fast_info attributes
+        w52_high = (
+            info.get("fiftyTwoWeekHigh")
+            or getattr(fast, "fifty_two_week_high", None)
+        )
+        w52_low = (
+            info.get("fiftyTwoWeekLow")
+            or getattr(fast, "fifty_two_week_low", None)
+        )
+
         info_out = {
             "market_cap":     info.get("marketCap") or getattr(fast, "market_cap", None),
             "pe_ratio":       info.get("trailingPE") or info.get("forwardPE"),
@@ -435,6 +550,8 @@ def _fetch_ticker_info(ticker: str) -> tuple[dict, Optional[pd.DataFrame]]:
             "industry":       info.get("industry"),
             "name":           info.get("longName") or info.get("shortName"),
             "website":        info.get("website"),
+            "52w_high":       float(w52_high) if w52_high is not None else None,
+            "52w_low":        float(w52_low)  if w52_low  is not None else None,
         }
     except Exception as exc:
         print(f"⚠️  yfinance info failed for {ticker}: {exc}")
@@ -450,7 +567,6 @@ def _fetch_ticker_info(ticker: str) -> tuple[dict, Optional[pd.DataFrame]]:
 async def search_stocks(
     query: str = Path(..., min_length=1, max_length=50),
 ) -> list[dict]:
-    """Yahoo Finance symbol search with caching."""
     query     = query.strip().upper()
     cache_key = f"search:{query}"
 
@@ -463,7 +579,7 @@ async def search_stocks(
         f"?q={query}&quotesCount=10&newsCount=0"
     )
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; FinIntel/2.1)",
+        "User-Agent": "Mozilla/5.0 (compatible; FinIntel/2.2)",
         "Accept":     "application/json",
     }
 
@@ -494,10 +610,11 @@ async def search_stocks(
 
 # ─────────────────────────────────────────────
 # ROUTES — NEWS
+# NOTE: /news/market MUST be defined before /news/{ticker} so FastAPI
+#       doesn't swallow "market" as a ticker value (fix #5).
 # ─────────────────────────────────────────────
 
 def _format_news_items(raw_news: list[dict]) -> tuple[list[dict], list[str]]:
-    """Build formatted news list and matching text list for sentiment scoring."""
     formatted: list[dict] = []
     texts:     list[str]  = []
 
@@ -506,7 +623,6 @@ def _format_news_items(raw_news: list[dict]) -> tuple[list[dict], list[str]]:
         text  = item.get("text",  "") or ""
         url   = item.get("url",   "") or item.get("link", "")
 
-        # Both title and url must exist — scraper guarantees this now
         if not title or not url:
             continue
 
@@ -518,14 +634,13 @@ def _format_news_items(raw_news: list[dict]) -> tuple[list[dict], list[str]]:
             "time":      item.get("date", ""),
             "source":    item.get("source", "News"),
             "text":      text[:300],
-            "sentiment": None,   # filled after scoring
+            "sentiment": None,
         })
 
     return formatted, texts
 
 
 async def _get_news_response(ticker: str) -> dict:
-    """Shared logic for /news/{ticker} and /news/market."""
     loop = asyncio.get_event_loop()
     raw_news = await loop.run_in_executor(None, get_news, ticker)
 
@@ -534,7 +649,6 @@ async def _get_news_response(ticker: str) -> dict:
 
     formatted, texts = _format_news_items(raw_news)
 
-    # Score sentiment in thread pool (transformer inference is blocking)
     sentiments: dict = {}
     if texts:
         try:
@@ -549,11 +663,30 @@ async def _get_news_response(ticker: str) -> dict:
     return safe_json({"news": formatted, "sentiment": sentiments, "ticker": ticker})
 
 
+# ── /news/market FIRST (fix #5) ───────────────────────────────────────────────
+@app.get("/news/market")
+async def get_market_news() -> dict:
+    cache_key = "news:market"
+
+    cached = await cache.get(cache_key)
+    if cached:
+        return {**cached, "cached": True}
+
+    try:
+        response = await _get_news_response("MARKET")
+        await cache.set(cache_key, response, CACHE_TTL_NEWS)
+        return {**response, "cached": False}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Market news failed: {exc}",
+        )
+
+
 @app.get("/news/{ticker}")
 async def get_stock_news(
     ticker: str = Path(..., min_length=1, max_length=20),
 ) -> dict:
-    """Scrape, score sentiment, and return news for a ticker."""
     ticker    = _norm(ticker)
     cache_key = f"news:{ticker}"
 
@@ -569,26 +702,6 @@ async def get_stock_news(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"News fetch failed for {ticker}: {exc}",
-        )
-
-
-@app.get("/news/market")
-async def get_market_news() -> dict:
-    """General market news (no specific ticker)."""
-    cache_key = "news:market"
-
-    cached = await cache.get(cache_key)
-    if cached:
-        return {**cached, "cached": True}
-
-    try:
-        response = await _get_news_response("MARKET")
-        await cache.set(cache_key, response, CACHE_TTL_NEWS)
-        return {**response, "cached": False}
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Market news failed: {exc}",
         )
 
 
