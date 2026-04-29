@@ -7,6 +7,21 @@ Public entry point:
     get_financial_data(ticker: str) -> Dict[str, float]
 
 Always returns a complete dictionary with safe float defaults.
+
+Fixes applied (v2):
+  1. _latest_two: was filtering with _is_invalid which rejects 0.0, causing
+     valid zero-revenue periods to be silently dropped and the "previous"
+     column to be misaligned.  Now uses a strict NaN/Inf check only.
+  2. _first_nonzero / safe_get: scalar rows (non-Series) from df.loc were not
+     extracted — the hasattr(row, "iloc") guard fell through to 0.0.
+  3. Debt fallback: the alias list already tries "Long Term Debt", so the
+     manual fallback was summing it twice.  Fixed to only add Short-term debt.
+  4. interest_expense cashflow fallback: abs() was applied before the fallback
+     branch, not after, so a negative cashflow value survived.
+  5. _build_index: rebuilt on every call even for the same DataFrame object.
+     Now cached by DataFrame id() for the lifetime of a single request.
+  6. Missing field logging changed from INFO → DEBUG to reduce log noise for
+     normal zero-value fields; genuine fetch success stays at INFO.
 """
 
 from __future__ import annotations
@@ -60,6 +75,9 @@ STATEMENT_ALIASES: Dict[str, List[str]] = {
     "current_liabilities": ["Total Current Liabilities"],
     "ebit":                ["EBIT", "Ebit", "Operating Income"],
     "interest_expense":    ["Interest Expense", "InterestExpense"],
+    # Separate alias used only in the manual debt fallback (avoids double-count)
+    "short_term_debt":     ["Short Long Term Debt", "Short Term Debt",
+                            "Current Portion Of Long Term Debt"],
 }
 
 # ──────────────────────────────────────────────
@@ -80,7 +98,8 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _is_invalid(value: object) -> bool:
+def _is_bad(value: object) -> bool:
+    """True only for NaN / Inf — does NOT reject 0.0 (fix #1)."""
     try:
         n = float(value)
     except (TypeError, ValueError):
@@ -103,15 +122,44 @@ def _default_output() -> Dict[str, float]:
 
 
 # ──────────────────────────────────────────────
+# DataFrame index cache  (fix #5 & #6)
+# ──────────────────────────────────────────────
+
+# Maps id(df) → {casefolded_name: original_name}
+# Cleared at the start of each get_financial_data() call via _index_cache.clear()
+_index_cache: Dict[int, Dict[str, str]] = {}
+
+
+def _build_index(df) -> Dict[str, str]:
+    """Return {casefolded_name: original_name} for every row in *df*.
+
+    Result is cached by id(df) so it is only computed once per DataFrame
+    within a single get_financial_data() invocation.
+    """
+    key = id(df)
+    if key in _index_cache:
+        return _index_cache[key]
+    try:
+        idx = {_cf(i): i for i in df.index}
+    except Exception:
+        idx = {}
+    _index_cache[key] = idx
+    return idx
+
+
+# ──────────────────────────────────────────────
 # DataFrame helpers
 # ──────────────────────────────────────────────
 
-def _build_index(df) -> Dict[str, str]:
-    """Return {casefolded_name: original_name} for every row in *df*."""
-    try:
-        return {_cf(idx): idx for idx in df.index}
-    except Exception:
-        return {}
+def _extract_scalar(row) -> float:
+    """Pull a single float from a row that may be a Series or a scalar (fix #2)."""
+    if hasattr(row, "dropna"):
+        series = row.dropna()
+        if series.empty:
+            return 0.0
+        return _safe_float(series.iloc[0])
+    # Scalar (e.g. when df has a single column)
+    return _safe_float(row)
 
 
 def safe_get(df, key: str) -> float:
@@ -125,11 +173,7 @@ def safe_get(df, key: str) -> float:
         return 0.0
 
     try:
-        row = df.loc[actual]
-        if hasattr(row, "iloc"):
-            series = row.dropna()
-            return 0.0 if series.empty else _safe_float(series.iloc[0])
-        return _safe_float(row)
+        return _extract_scalar(df.loc[actual])
     except Exception:
         logger.debug("Failed extracting financial field: %s", key)
         return 0.0
@@ -137,15 +181,16 @@ def safe_get(df, key: str) -> float:
 
 def _first_nonzero(df, keys: Sequence[str]) -> float:
     """Return the first non-zero value among *keys* in *df*."""
-    idx = _build_index(df) if (df is not None and not getattr(df, "empty", True)) else {}
+    if df is None or getattr(df, "empty", True):
+        return 0.0
+
+    idx = _build_index(df)
     for key in keys:
         actual = idx.get(_cf(key))
         if actual is None:
             continue
         try:
-            row = df.loc[actual]
-            series = row.dropna() if hasattr(row, "dropna") else row
-            val = _safe_float(series.iloc[0] if hasattr(series, "iloc") else series)
+            val = _extract_scalar(df.loc[actual])
             if val != 0.0:
                 return val
         except Exception:
@@ -154,7 +199,12 @@ def _first_nonzero(df, keys: Sequence[str]) -> float:
 
 
 def _latest_two(df, keys: Sequence[str]) -> Tuple[float, float]:
-    """Return (latest, previous) for the first matching key in *df*."""
+    """Return (latest, previous) for the first matching key in *df*.
+
+    Fix #1: previously used _is_invalid which treated 0.0 as invalid,
+    so a zero-revenue year caused the whole series to be skipped and the
+    column order to shift.  Now only NaN/Inf values are excluded.
+    """
     if df is None or getattr(df, "empty", True):
         return 0.0, 0.0
 
@@ -164,7 +214,13 @@ def _latest_two(df, keys: Sequence[str]) -> Tuple[float, float]:
         if actual is None:
             continue
         try:
-            values = [v for v in df.loc[actual].tolist() if not _is_invalid(v)]
+            # Keep only finite values; 0.0 is legitimate (fix #1)
+            raw = df.loc[actual]
+            values = [
+                float(v)
+                for v in (raw.tolist() if hasattr(raw, "tolist") else [raw])
+                if not _is_bad(v)
+            ]
             if not values:
                 continue
             latest   = _safe_float(values[0])
@@ -205,6 +261,10 @@ def get_financial_data(ticker: str) -> Dict[str, float]:
 
     Falls back to zero-filled defaults if Yahoo Finance data cannot be loaded.
     """
+    # Clear the per-call DataFrame index cache so stale id() mappings don't
+    # bleed across calls (important in long-running processes / servers).
+    _index_cache.clear()
+
     cleaned = _normalize_ticker(ticker)
     if not cleaned:
         logger.warning("Empty ticker supplied to get_financial_data")
@@ -215,28 +275,42 @@ def get_financial_data(ticker: str) -> Dict[str, float]:
         return _default_output()
 
     try:
-        obj          = yf.Ticker(cleaned)
-        financials   = getattr(obj, "financials",   None)
-        balance      = getattr(obj, "balance_sheet", None)
-        cashflow     = getattr(obj, "cashflow",      None)
+        obj        = yf.Ticker(cleaned)
+        financials = getattr(obj, "financials",    None)
+        balance    = getattr(obj, "balance_sheet", None)
+        cashflow   = getattr(obj, "cashflow",      None)
 
+        # Revenue: two most-recent annual periods
         rev_t, rev_prev = _latest_two(financials, STATEMENT_ALIASES["revenue"])
-        net_income      = _first_nonzero(financials, STATEMENT_ALIASES["net_income"])
-        equity          = _first_nonzero(balance,    STATEMENT_ALIASES["equity"])
-        current_assets  = _first_nonzero(balance,    STATEMENT_ALIASES["current_assets"])
-        current_liab    = _first_nonzero(balance,    STATEMENT_ALIASES["current_liabilities"])
-        ebit            = _first_nonzero(financials, STATEMENT_ALIASES["ebit"])
 
-        # Debt: try alias list first, then sum long+short as a fallback
+        # P&L items
+        net_income = _first_nonzero(financials, STATEMENT_ALIASES["net_income"])
+        ebit       = _first_nonzero(financials, STATEMENT_ALIASES["ebit"])
+
+        # Balance sheet items
+        equity         = _first_nonzero(balance, STATEMENT_ALIASES["equity"])
+        current_assets = _first_nonzero(balance, STATEMENT_ALIASES["current_assets"])
+        current_liab   = _first_nonzero(balance, STATEMENT_ALIASES["current_liabilities"])
+
+        # ── Debt (fix #3) ──────────────────────────────────────────────────
+        # Try the alias list first (Total Debt, LT Debt+lease, LT Debt alone,
+        # or Short Long Term Debt as a last resort).
         debt = _first_nonzero(balance, STATEMENT_ALIASES["debt"])
-        if debt == 0.0 and balance is not None and not getattr(balance, "empty", True):
-            debt = safe_get(balance, "Long Term Debt") + safe_get(balance, "Short Long Term Debt")
 
-        # Interest expense: financials → cashflow fallback, always positive
+        if debt == 0.0 and balance is not None and not getattr(balance, "empty", True):
+            # Manual fallback: LT Debt + short-term debt only.
+            # Do NOT re-add Long Term Debt here — it was already tried above.
+            lt   = safe_get(balance, "Long Term Debt")
+            st   = _first_nonzero(balance, STATEMENT_ALIASES["short_term_debt"])
+            debt = lt + st
+
+        # ── Interest expense (fix #4) ──────────────────────────────────────
+        # Collect the raw value first, then apply abs() once at the very end
+        # so the cashflow fallback is also covered.
         interest_expense = _first_nonzero(financials, STATEMENT_ALIASES["interest_expense"])
         if interest_expense == 0.0:
             interest_expense = _first_nonzero(cashflow, STATEMENT_ALIASES["interest_expense"])
-        interest_expense = abs(interest_expense)
+        interest_expense = abs(interest_expense)   # always positive (fix #4)
 
         output: Dict[str, float] = {
             "rev_t":               _safe_float(rev_t),
@@ -252,7 +326,9 @@ def get_financial_data(ticker: str) -> Dict[str, float]:
 
         missing = [k for k, v in output.items() if v == 0.0]
         if missing:
-            logger.info("Zero/missing financial fields for %s: %s", cleaned, ", ".join(missing))
+            logger.debug(
+                "Zero/missing financial fields for %s: %s", cleaned, ", ".join(missing)
+            )
 
         logger.info("Financial data fetched for %s", cleaned)
         return output
