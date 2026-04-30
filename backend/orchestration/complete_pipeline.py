@@ -495,72 +495,132 @@ def get_fundamental_result(ticker: str) -> dict:
 
 def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[float, str]:
     """
-    Fuse the three signal scores into a single decision.
+    Fuse ML probabilities, sentiment, fundamentals, and risk into one decision.
 
-    Fix #3 — Weight rebalancing:
-      Old: 0.35 tech + 0.35 fund + 0.25 senti + 0.05 risk_penalty
-      Problem: fundamental_score is 0.0 when financial scraper returns zeros,
-               dragging final_score below 0.45 even for strong BUY signals.
-      New: When fundamental_score > 0 use it with full weight.
-           When it is 0 (unavailable), redistribute its weight to tech+senti.
+    ── How the ML signal enters the fusion ─────────────────────────────────────
+    The GRU is a Triple Barrier classifier. Its softmax head produces three
+    numbers that mean something specific:
+        p_buy  = P(price hits profit target first)
+        p_sell = P(price hits stop-loss first)
+        p_hold = P(neither barrier is hit in time → sideways/choppy)
 
-    Fix #6 — p_hold conviction dampener:
-      When the GRU's p_hold is high the model is seeing a choppy/sideways
-      market. We apply a conviction multiplier to the entire fused score so
-      that uncertainty in the ML signal propagates into the final decision
-      rather than being silently discarded after tech_score is computed.
-      Formula: conviction_multiplier = 0.5 + 0.5 * (1 - p_hold)
-        p_hold=0.0 → multiplier=1.0  (fully decisive model, no dampening)
-        p_hold=0.5 → multiplier=0.75 (moderate uncertainty)
-        p_hold=1.0 → multiplier=0.5  (full uncertainty, halve the score)
+    Previous versions collapsed these into a single technical_score scalar and
+    then used that scalar in the weighted sum.  That loses information: a model
+    that is 80% confident on SELL and a model that is 80% confident on HOLD
+    both produce a technical_score near 0.5 with the old formula.
 
-    Fix #7 — Lower thresholds to match conviction-dampened distribution:
-      BUY  ≥ 0.62  (was 0.68)
-      HOLD ≥ 0.42  (was 0.45)
+    Correct design — two roles, one prob each:
+      • DIRECTION  → p_buy and p_sell enter the weighted sum directly as the
+                     tech component, expressed as net bull pressure mapped to
+                     [0, 1]:  ml_direction = (p_buy - p_sell + 1) / 2
+                     This is what drives BUY vs SELL in the final score.
+      • CONVICTION → p_hold gates the entire fused score as a multiplier.
+                     High p_hold (model sees sideways market) shrinks the whole
+                     score toward 0.5, pulling the decision toward HOLD
+                     regardless of what sentiment or fundamentals say.
+                     Formula: gate = 0.5 + 0.5 * (1 - p_hold)
+                       p_hold=0.00 → gate=1.00  (model fully decisive)
+                       p_hold=0.50 → gate=0.75  (moderate uncertainty)
+                       p_hold=0.90 → gate=0.55  (model almost sure: sideways)
+
+    When the GRU is unavailable (MA/RSI fallback), synthetic prob stubs are
+    already injected by _ma_crossover_score(), so this path is always safe.
+
+    ── Adaptive weights ─────────────────────────────────────────────────────────
+    Fundamentals are often unavailable (scraper returns 0.0).  When they are,
+    their weight is redistributed to ml_direction + sentiment so the decision
+    is still meaningful.
+
+    ── Thresholds ───────────────────────────────────────────────────────────────
+    After the conviction gate, scores are centred around 0.5 and compressed
+    toward it when p_hold is high.  Thresholds are calibrated to that range:
+      BUY  ≥ 0.62
+      HOLD ≥ 0.42
+      SELL  < 0.42
     """
-    tech_score  = _safe_float(tech.get("technical_score"),   0.5)
+    # ── 1. Read all raw inputs ────────────────────────────────────────────────
     fund_score  = _safe_float(fund.get("fundamental_score"), 0.0)
     senti_score = _safe_float(senti.get("sentiment_score"),  0.5)
     risk_score  = _safe_float(risk.get("risk_score"),        0.0)
 
-    risk_penalty = 1.0 - risk_score
+    # Read the three Triple Barrier probabilities directly from the tech dict.
+    # _safe_float with default=None used for p_hold so we can distinguish
+    # "GRU ran and returned 0.0" from "key missing entirely".
+    p_buy_raw  = tech.get("p_buy")
+    p_sell_raw = tech.get("p_sell")
+    p_hold_raw = tech.get("p_hold")
 
-    # Amplify extreme sentiment
+    have_ml_probs = (
+        p_buy_raw  is not None and _is_valid_number(p_buy_raw)  and
+        p_sell_raw is not None and _is_valid_number(p_sell_raw) and
+        p_hold_raw is not None and _is_valid_number(p_hold_raw)
+    )
+
+    if have_ml_probs:
+        p_buy  = float(p_buy_raw)
+        p_sell = float(p_sell_raw)
+        p_hold = float(p_hold_raw)
+
+        # DIRECTION: net bull pressure mapped from [-1,+1] → [0,1].
+        # This is the tech component that enters the weighted sum.
+        # p_buy=0.85, p_sell=0.05 → ml_direction=0.90  (strongly bullish)
+        # p_buy=0.05, p_sell=0.80 → ml_direction=0.125 (strongly bearish)
+        # p_buy=0.45, p_sell=0.45 → ml_direction=0.50  (genuinely uncertain)
+        ml_direction = float(np.clip((p_buy - p_sell + 1.0) / 2.0, 0.0, 1.0))
+
+        # CONVICTION GATE: p_hold shrinks the whole fused score toward 0.5.
+        # Floor of 0.5 ensures we never zero-out a clear directional signal.
+        conviction_gate = 0.5 + 0.5 * (1.0 - p_hold)   # [0.5, 1.0]
+
+        logger.debug(
+            "ML probs: p_buy=%.3f p_sell=%.3f p_hold=%.3f "
+            "→ ml_direction=%.3f conviction_gate=%.3f",
+            p_buy, p_sell, p_hold, ml_direction, conviction_gate,
+        )
+    else:
+        # No ML probs: fall back to the scalar technical_score, no gate.
+        tech_score_fallback = _safe_float(tech.get("technical_score"), 0.5)
+        ml_direction        = tech_score_fallback
+        conviction_gate     = 1.0
+        p_hold              = None
+        logger.debug("No ML probs in tech dict — using technical_score=%.3f", ml_direction)
+
+    # ── 2. Sentiment amplification ────────────────────────────────────────────
+    # Push already-extreme sentiment scores further so they have real influence.
     if senti_score > 0.7:
         senti_score = min(1.0, senti_score + 0.1)
     elif senti_score < 0.3:
         senti_score = max(0.0, senti_score - 0.1)
 
-    # ── Fix #6: p_hold conviction dampener ──────────────────────────────
-    # High p_hold = model sees a sideways/choppy market → reduce confidence
-    # in ALL signals, not just the technical component.
-    p_hold = tech.get("p_hold")   # present when GRU ran; None for fallback
-    if p_hold is not None and _is_valid_number(p_hold):
-        ml_conviction         = 1.0 - float(p_hold)          # [0, 1]
-        conviction_multiplier = 0.5 + 0.5 * ml_conviction     # [0.5, 1.0]
-        logger.debug("p_hold=%.3f → conviction_multiplier=%.3f", float(p_hold), conviction_multiplier)
-    else:
-        conviction_multiplier = 1.0  # no dampening when probs unavailable
+    risk_penalty = 1.0 - risk_score
 
-    # ── Fix #3: Adaptive weights ─────────────────────────────────────────
+    # ── 3. Adaptive weights ───────────────────────────────────────────────────
+    # ml_direction is the tech component.  When fundamentals are unavailable
+    # their weight shifts to ml_direction + sentiment.
     fundamentals_available = fund_score > 0.01
     if fundamentals_available:
-        w_tech, w_fund, w_senti, w_risk = 0.35, 0.35, 0.25, 0.05
+        w_ml, w_fund, w_senti, w_risk = 0.35, 0.35, 0.25, 0.05
     else:
-        # Redistribute fundamental weight: 60% tech, 35% sentiment, 5% risk
-        w_tech, w_fund, w_senti, w_risk = 0.60, 0.00, 0.35, 0.05
+        w_ml, w_fund, w_senti, w_risk = 0.60, 0.00, 0.35, 0.05
 
     raw_score = (
-        w_tech  * tech_score  +
-        w_fund  * fund_score  +
-        w_senti * senti_score +
+        w_ml    * ml_direction +
+        w_fund  * fund_score   +
+        w_senti * senti_score  +
         w_risk  * risk_penalty
     )
 
-    # Apply conviction dampener to the whole fused score
-    final_score = float(np.clip(raw_score * conviction_multiplier, 0.0, 1.0))
+    # ── 4. Apply conviction gate ──────────────────────────────────────────────
+    # Multiply the raw score by the gate, then re-centre around 0.5.
+    # When gate=1.0 (decisive model) → final_score = raw_score unchanged.
+    # When gate=0.5 (full uncertainty) → final_score pulled halfway to 0.5.
+    # Re-centring formula: 0.5 + (raw_score - 0.5) * gate
+    #   raw=0.80, gate=0.55 → 0.5 + 0.30*0.55 = 0.665  (still BUY, muted)
+    #   raw=0.80, gate=1.00 → 0.5 + 0.30*1.00 = 0.800  (full BUY)
+    #   raw=0.20, gate=0.55 → 0.5 - 0.30*0.55 = 0.335  (still SELL, muted)
+    final_score = float(np.clip(0.5 + (raw_score - 0.5) * conviction_gate, 0.0, 1.0))
 
-    # ── Fix #7: Lowered thresholds ───────────────────────────────────────
+    # ── 5. Threshold decision ─────────────────────────────────────────────────
     if final_score >= 0.62:
         decision = "BUY"
     elif final_score >= 0.42:
@@ -568,18 +628,18 @@ def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[fl
     else:
         decision = "SELL"
 
-    # News override for extreme sentiment
+    # Hard news override: extreme sentiment overrides a borderline score.
     if senti_score < 0.25:
         decision = "SELL (Negative News Impact)"
     elif senti_score > 0.85:
         decision = "BUY (Positive News Momentum)"
 
     logger.info(
-        "Fusion: tech=%.3f fund=%.3f senti=%.3f risk=%.3f "
-        "p_hold=%s conviction_mult=%.3f raw=%.4f → final=%.4f %s",
-        tech_score, fund_score, senti_score, risk_score,
-        f"{float(p_hold):.3f}" if p_hold is not None and _is_valid_number(p_hold) else "N/A",
-        conviction_multiplier, raw_score, final_score, decision,
+        "Fusion: ml_dir=%.3f fund=%.3f senti=%.3f risk=%.3f "
+        "p_hold=%s gate=%.3f raw=%.4f → final=%.4f  →  %s",
+        ml_direction, fund_score, senti_score, risk_score,
+        f"{p_hold:.3f}" if p_hold is not None else "N/A",
+        conviction_gate, raw_score, final_score, decision,
     )
     return final_score, decision
 
