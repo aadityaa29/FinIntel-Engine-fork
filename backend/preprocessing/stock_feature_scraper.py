@@ -1,4 +1,3 @@
-
 import json
 import logging
 from pathlib import Path
@@ -132,7 +131,17 @@ def run_technical_model(price_df: pd.DataFrame) -> dict:
         score = float(np.clip(0.5 + np.sign(ma20 - ma50) * 0.25, 0.0, 1.0))
         sig = 'BUY' if ma20 > ma50 else ('SELL' if ma20 < ma50 else 'HOLD')
         conf = 'high' if abs(ma20 - ma50) / (ma50 + 1e-9) > 0.01 else 'medium'
-        return {"technical_score": score, "signal": sig, "confidence": conf}
+        # Provide synthetic prob stubs so the fusion layer has consistent keys
+        if sig == 'BUY':
+            p_sell, p_hold, p_buy = 0.1, 1.0 - score, score
+        elif sig == 'SELL':
+            p_sell, p_hold, p_buy = 1.0 - score, score, 0.1
+        else:
+            p_sell, p_hold, p_buy = 0.25, 0.5, 0.25
+        return {
+            "technical_score": score, "signal": sig, "confidence": conf,
+            "p_sell": p_sell, "p_hold": p_hold, "p_buy": p_buy,
+        }
 
     feats_df = build_technical_features(price_df, feature_cols)
     window_size = 20
@@ -142,7 +151,10 @@ def run_technical_model(price_df: pd.DataFrame) -> dict:
 
     if len(feats_df) == 0:
         logger.warning('No technical features produced; returning HOLD')
-        return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
+        return {
+            "technical_score": 0.5, "signal": "HOLD", "confidence": "low",
+            "p_sell": 0.25, "p_hold": 0.5, "p_buy": 0.25,
+        }
 
     # Search for a NaN-free window from the end backwards
     valid_window = None
@@ -186,26 +198,72 @@ def run_technical_model(price_df: pd.DataFrame) -> dict:
         score = float(np.clip(0.5 + np.sign(ma20 - ma50) * 0.25, 0.0, 1.0))
         sig = 'BUY' if ma20 > ma50 else ('SELL' if ma20 < ma50 else 'HOLD')
         conf = 'high' if abs(ma20 - ma50) / (ma50 + 1e-9) > 0.01 else 'medium'
-        return {"technical_score": score, "signal": sig, "confidence": conf}
+        if sig == 'BUY':
+            p_sell, p_hold, p_buy = 0.1, 1.0 - score, score
+        elif sig == 'SELL':
+            p_sell, p_hold, p_buy = 1.0 - score, score, 0.1
+        else:
+            p_sell, p_hold, p_buy = 0.25, 0.5, 0.25
+        return {
+            "technical_score": score, "signal": sig, "confidence": conf,
+            "p_sell": p_sell, "p_hold": p_hold, "p_buy": p_buy,
+        }
 
     preds = model.predict(X_window)
+
+    # ── FIX: Preserve full probability distribution, use directional scoring ──
     if preds.ndim == 2 and preds.shape[-1] == 3:
         probs = torch.softmax(torch.tensor(preds[0]), dim=0).numpy()
-        score = float(probs[2] * 1.0 + probs[1] * 0.5 + probs[0] * 0.0)
-        arg = int(np.argmax(probs))
+        p_sell, p_hold, p_buy = float(probs[0]), float(probs[1]), float(probs[2])
+
+        # Directional signal: net bull pressure, dampened by conviction.
+        # net_direction ∈ [-1, +1]: positive = bullish, negative = bearish.
+        # conviction    ∈ [0,  1]: near 0 when model is uncertain (high p_hold).
+        # Old formula:  probs[2]*1 + probs[1]*0.5 + probs[0]*0  → asymmetric,
+        #               an 80% SELL only scored ~0.10 while an 80% HOLD scored 0.50.
+        net_direction = p_buy - p_sell          # [-1, +1]
+        conviction    = 1.0 - p_hold            # [0,  1]
+        weighted      = net_direction * conviction  # [-1, +1]
+
+        # Map [-1, +1] → [0, 1] for the engine's score scale
+        score = float(np.clip((weighted + 1.0) / 2.0, 0.0, 1.0))
+
+        arg    = int(np.argmax(probs))
         labels = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
         signal = labels.get(arg, 'HOLD')
         confidence = 'high' if probs.max() > 0.7 else ('medium' if probs.max() > 0.5 else 'low')
+
+        logger.info(
+            "GRU probs — p_sell=%.3f p_hold=%.3f p_buy=%.3f → net_dir=%.3f "
+            "conviction=%.3f score=%.4f signal=%s",
+            p_sell, p_hold, p_buy, net_direction, conviction, score, signal,
+        )
     else:
-        val = float(preds.ravel()[-1])
+        # Scalar output fallback (non-3-class model)
+        val   = float(preds.ravel()[-1])
         score = float(np.clip(val, 0.0, 1.0))
         signal = 'BUY' if score > 0.6 else ('SELL' if score < 0.4 else 'HOLD')
         confidence = 'medium'
+        # Synthetic prob stubs for consistent fusion-layer keys
+        if signal == 'BUY':
+            p_sell, p_hold, p_buy = 0.1, 1.0 - score, score
+        elif signal == 'SELL':
+            p_sell, p_hold, p_buy = 1.0 - score, score, 0.1
+        else:
+            p_sell, p_hold, p_buy = 0.25, 0.5, 0.25
 
-    return {"technical_score": score, "signal": signal, "confidence": confidence}
+    return {
+        "technical_score": score,
+        "signal":          signal,
+        "confidence":      confidence,
+        # Raw probabilities preserved for the fusion layer (Fix #1)
+        "p_sell":          p_sell,
+        "p_hold":          p_hold,
+        "p_buy":           p_buy,
+    }
+
 
 def tech_prediction_pipeline(ticker: str) -> dict:
     price_df = fetch_price_data(ticker)
     result = run_technical_model(price_df)
     return result
-

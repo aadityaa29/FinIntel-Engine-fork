@@ -2,12 +2,14 @@
 backend/orchestration/complete_pipeline.py
 Optimized pipeline: parallel execution, deduped logic, dead-code removed.
 
-Fixes applied (v2):
+Fixes applied (v3):
   1. get_technical_result: run_technical_model returns None on model failure
      but the result was being used directly — added explicit None check so
      the MA crossover fallback always fires when the model can't run.
   2. MA crossover fallback: now also computes RSI-based refinement and returns
-     a more accurate score instead of a hard-clipped 0.5±0.25.
+     a more accurate score instead of a hard-clipped 0.5±0.25.  Also emits
+     synthetic p_sell/p_hold/p_buy stubs so the fusion layer never crashes
+     trying to read those keys.
   3. fuse_and_decide: fundamental_score was weighted 0.35 but was almost always
      0.0 (scraper issues), dragging final_score below 0.45 → forced HOLD/SELL.
      Weights re-balanced so technical + sentiment carry the score when
@@ -16,6 +18,11 @@ Fixes applied (v2):
      fixed to never return None (always returns empty DataFrame as sentinel).
   5. technical_score key: pipeline returned result["technical"]["technical_score"]
      which main.py now reads correctly — verified key path is consistent.
+  6. fuse_and_decide: reads p_hold from tech dict to build a conviction
+     multiplier — high p_hold (model sees sideways/choppy market) dampens the
+     entire fused score rather than just the technical component.
+  7. Decision thresholds lowered to match the new conviction-dampened score
+     distribution: BUY ≥ 0.62 (was 0.68), HOLD ≥ 0.42 (was 0.45).
 """
 
 from __future__ import annotations
@@ -145,11 +152,17 @@ def _ma_crossover_score(price_df: pd.DataFrame) -> dict:
     Compute a technical score purely from price data when the GRU model
     is unavailable.  Uses MA crossover + RSI to produce a smoother score
     than the old hard-clipped 0.25/0.75 values.
+
+    Also emits synthetic p_sell/p_hold/p_buy stubs (fix #2 extension) so the
+    fusion layer has consistent keys regardless of which code path ran.
     """
     try:
         close = price_df["Close"].dropna()
         if len(close) < 50:
-            return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
+            return {
+                "technical_score": 0.5, "signal": "HOLD", "confidence": "low",
+                "p_sell": 0.25, "p_hold": 0.5, "p_buy": 0.25,
+            }
 
         ma20 = float(close.rolling(20).mean().iloc[-1])
         ma50 = float(close.rolling(50).mean().iloc[-1])
@@ -164,7 +177,7 @@ def _ma_crossover_score(price_df: pd.DataFrame) -> dict:
         rsi    = float(100 - (100 / (1 + rs.iloc[-1])))
 
         # Score components
-        ma_signal   = 1.0 if ma20 > ma50 else 0.0          # Golden/death cross
+        ma_signal   = 1.0 if ma20 > ma50 else 0.0
         trend_above = 1.0 if float(close.iloc[-1]) > ma200 else 0.0
         rsi_score   = float(np.clip((rsi - 30) / 40, 0.0, 1.0))  # 30→0, 70→1
 
@@ -181,15 +194,33 @@ def _ma_crossover_score(price_df: pd.DataFrame) -> dict:
         else:
             signal = "HOLD"
 
+        # ── Synthetic prob stubs so fusion layer has consistent keys ──────
+        if signal == "BUY":
+            p_sell, p_hold, p_buy = 0.1, 1.0 - score, score
+        elif signal == "SELL":
+            p_sell, p_hold, p_buy = 1.0 - score, score, 0.1
+        else:
+            p_sell, p_hold, p_buy = 0.25, 0.5, 0.25
+
         logger.info(
             "MA+RSI fallback — score=%.4f signal=%s rsi=%.1f ma20=%.2f ma50=%.2f",
             score, signal, rsi, ma20, ma50,
         )
-        return {"technical_score": score, "signal": signal, "confidence": confidence}
+        return {
+            "technical_score": score,
+            "signal":          signal,
+            "confidence":      confidence,
+            "p_sell":          p_sell,
+            "p_hold":          p_hold,
+            "p_buy":           p_buy,
+        }
 
     except Exception as exc:
         logger.exception("MA crossover fallback failed: %s", exc)
-        return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
+        return {
+            "technical_score": 0.5, "signal": "HOLD", "confidence": "low",
+            "p_sell": 0.25, "p_hold": 0.5, "p_buy": 0.25,
+        }
 
 
 # ──────────────────────────────────────────────
@@ -322,7 +353,10 @@ def get_technical_result(ticker: str) -> dict:
     price_df = _get_price_data(cleaned)
     if price_df.empty:
         logger.warning("No price data for technical analysis: %s", cleaned)
-        return {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"}
+        return {
+            "technical_score": 0.5, "signal": "HOLD", "confidence": "low",
+            "p_sell": 0.25, "p_hold": 0.5, "p_buy": 0.25,
+        }
 
     # ── Try GRU model ────────────────────────────────────────────────────
     stock_mod = _load_module("backend.preprocessing.stock_feature_scraper")
@@ -394,8 +428,8 @@ def get_sentiment_result(ticker: str) -> dict:
     if not scores:
         return _cached_fallback("Empty sentiment scores")
 
-    base_score     = float(np.mean(scores))
-    volume_score   = _compute_news_volume_score(len(texts))
+    base_score      = float(np.mean(scores))
+    volume_score    = _compute_news_volume_score(len(texts))
     sentiment_score = float(np.clip(0.75 * base_score + 0.25 * volume_score, 0.0, 1.0))
 
     _store_sentiment_cache(cleaned, sentiment_score, len(texts), volume_score)
@@ -456,21 +490,33 @@ def get_fundamental_result(ticker: str) -> dict:
 
 
 # ──────────────────────────────────────────────
-# Fusion  (fix #3 — rebalanced weights)
+# Fusion  (fixes #3, #6, #7)
 # ──────────────────────────────────────────────
 
 def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[float, str]:
     """
     Fuse the three signal scores into a single decision.
 
-    Weight rebalancing (fix #3):
+    Fix #3 — Weight rebalancing:
       Old: 0.35 tech + 0.35 fund + 0.25 senti + 0.05 risk_penalty
       Problem: fundamental_score is 0.0 when financial scraper returns zeros,
                dragging final_score below 0.45 even for strong BUY signals.
-
       New: When fundamental_score > 0 use it with full weight.
-           When it is 0 (unavailable), redistribute its weight to tech+senti
-           so the signal is still meaningful.
+           When it is 0 (unavailable), redistribute its weight to tech+senti.
+
+    Fix #6 — p_hold conviction dampener:
+      When the GRU's p_hold is high the model is seeing a choppy/sideways
+      market. We apply a conviction multiplier to the entire fused score so
+      that uncertainty in the ML signal propagates into the final decision
+      rather than being silently discarded after tech_score is computed.
+      Formula: conviction_multiplier = 0.5 + 0.5 * (1 - p_hold)
+        p_hold=0.0 → multiplier=1.0  (fully decisive model, no dampening)
+        p_hold=0.5 → multiplier=0.75 (moderate uncertainty)
+        p_hold=1.0 → multiplier=0.5  (full uncertainty, halve the score)
+
+    Fix #7 — Lower thresholds to match conviction-dampened distribution:
+      BUY  ≥ 0.62  (was 0.68)
+      HOLD ≥ 0.42  (was 0.45)
     """
     tech_score  = _safe_float(tech.get("technical_score"),   0.5)
     fund_score  = _safe_float(fund.get("fundamental_score"), 0.0)
@@ -485,7 +531,18 @@ def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[fl
     elif senti_score < 0.3:
         senti_score = max(0.0, senti_score - 0.1)
 
-    # Adaptive weights: if fundamentals unavailable, lean on tech + sentiment
+    # ── Fix #6: p_hold conviction dampener ──────────────────────────────
+    # High p_hold = model sees a sideways/choppy market → reduce confidence
+    # in ALL signals, not just the technical component.
+    p_hold = tech.get("p_hold")   # present when GRU ran; None for fallback
+    if p_hold is not None and _is_valid_number(p_hold):
+        ml_conviction         = 1.0 - float(p_hold)          # [0, 1]
+        conviction_multiplier = 0.5 + 0.5 * ml_conviction     # [0.5, 1.0]
+        logger.debug("p_hold=%.3f → conviction_multiplier=%.3f", float(p_hold), conviction_multiplier)
+    else:
+        conviction_multiplier = 1.0  # no dampening when probs unavailable
+
+    # ── Fix #3: Adaptive weights ─────────────────────────────────────────
     fundamentals_available = fund_score > 0.01
     if fundamentals_available:
         w_tech, w_fund, w_senti, w_risk = 0.35, 0.35, 0.25, 0.05
@@ -493,18 +550,20 @@ def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[fl
         # Redistribute fundamental weight: 60% tech, 35% sentiment, 5% risk
         w_tech, w_fund, w_senti, w_risk = 0.60, 0.00, 0.35, 0.05
 
-    final_score = float(np.clip(
+    raw_score = (
         w_tech  * tech_score  +
         w_fund  * fund_score  +
         w_senti * senti_score +
-        w_risk  * risk_penalty,
-        0.0, 1.0,
-    ))
+        w_risk  * risk_penalty
+    )
 
-    # Decision thresholds
-    if final_score >= 0.68:
+    # Apply conviction dampener to the whole fused score
+    final_score = float(np.clip(raw_score * conviction_multiplier, 0.0, 1.0))
+
+    # ── Fix #7: Lowered thresholds ───────────────────────────────────────
+    if final_score >= 0.62:
         decision = "BUY"
-    elif final_score >= 0.45:
+    elif final_score >= 0.42:
         decision = "HOLD"
     else:
         decision = "SELL"
@@ -516,8 +575,11 @@ def fuse_and_decide(tech: dict, fund: dict, senti: dict, risk: dict) -> Tuple[fl
         decision = "BUY (Positive News Momentum)"
 
     logger.info(
-        "Fusion: tech=%.3f fund=%.3f senti=%.3f risk=%.3f → final=%.4f %s",
-        tech_score, fund_score, senti_score, risk_score, final_score, decision,
+        "Fusion: tech=%.3f fund=%.3f senti=%.3f risk=%.3f "
+        "p_hold=%s conviction_mult=%.3f raw=%.4f → final=%.4f %s",
+        tech_score, fund_score, senti_score, risk_score,
+        f"{float(p_hold):.3f}" if p_hold is not None and _is_valid_number(p_hold) else "N/A",
+        conviction_multiplier, raw_score, final_score, decision,
     )
     return final_score, decision
 
@@ -545,7 +607,10 @@ def run_complete_pipeline(ticker: str) -> dict:
     _get_price_data(cleaned)
 
     defaults = {
-        "technical":   {"technical_score": 0.5, "signal": "HOLD", "confidence": "low"},
+        "technical":   {
+            "technical_score": 0.5, "signal": "HOLD", "confidence": "low",
+            "p_sell": 0.25, "p_hold": 0.5, "p_buy": 0.25,
+        },
         "sentiment":   {"sentiment_score": 0.5, "num_articles": 0, "news_volume_score": 0.0},
         "fundamental": {"fundamental_score": 0.0, "risk_score": 0.0, "details": {}},
     }
